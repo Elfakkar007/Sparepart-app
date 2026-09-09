@@ -1,0 +1,124 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ===== MASTER DATA (dropdown, bisa ditambah Admin) =====
+
+model Kategori {
+  id         String      @id @default(cuid())
+  nama       String      @unique
+  spareparts Sparepart[]
+}
+
+model LokasiRak {
+  id         String      @id @default(cuid())
+  nama       String      @unique
+  spareparts Sparepart[]
+}
+
+model Satuan {
+  id         String      @id @default(cuid())
+  nama       String      @unique
+  spareparts Sparepart[]
+}
+
+// ===== SPAREPART (master part) =====
+
+model Sparepart {
+  id           String   @id @default(cuid())
+  itemCode     String   @unique
+  namaPart     String
+  spesifikasi  String?
+  keterangan   String?
+  stok         Int      @default(0)
+
+  kategoriId   String
+  kategori     Kategori  @relation(fields: [kategoriId], references: [id])
+
+  satuanId     String
+  satuan       Satuan    @relation(fields: [satuanId], references: [id])
+
+  lokasiRakId  String?
+  lokasiRak    LokasiRak? @relation(fields: [lokasiRakId], references: [id])
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  lineStocks   SparepartLineStock[]
+  movements    StockMovement[]
+}
+
+// ===== BREAKDOWN STOK PER LINE =====
+
+model SparepartLineStock {
+  id              String   @id @default(cuid())
+  sparepartId     String
+  sparepart       Sparepart @relation(fields: [sparepartId], references: [id])
+  line            Line
+  jumlah          Int      @default(0)
+  minStok         Int      @default(0)
+  lastOpnameDate  DateTime?
+
+  @@unique([sparepartId, line])
+}
+
+enum Line {
+  LINE_1
+  LINE_2
+  LINE_3
+  LINE_4
+  GENERAL
+}
+
+// ===== HISTORI / AUDIT =====
+
+model StockMovement {
+  id          String     @id @default(cuid())
+  user        User     @relation(fields: [userId], references: [id])
+  sparepartId String
+  sparepart   Sparepart  @relation(fields: [sparepartId], references: [id])
+  line        Line
+  tipe        TipeMovement
+  sumber      SumberMovement
+  jumlah      Int
+  referensi   String?
+  keterangan  String?
+  userId      String
+  createdAt   DateTime   @default(now())
+}
+
+enum TipeMovement {
+  MASUK
+  KELUAR
+  KOREKSI
+}
+
+enum SumberMovement {
+  ADMIN_MASUK
+  ADMIN_KOREKSI
+  LOGBOOK
+  PM
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  role         Role
+  createdAt    DateTime @default(now())
+
+  movements    StockMovement[]
+}
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+}
