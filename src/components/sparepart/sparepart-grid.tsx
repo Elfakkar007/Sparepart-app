@@ -2,9 +2,13 @@
 
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Filter, Check, X, Loader2 } from "lucide-react";
-import { updateSparepartField, type getSparepartList } from "@/lib/actions/sparepart";
+import {
+    updateSparepartField,
+    updateSparepartRelation,
+    type getSparepartList,
+} from "@/lib/actions/sparepart";
 import { recordStockMovement, updateLineMinStok } from "@/lib/actions/stock-movement";
-import type { Line } from "@/generated/prisma/client";
+import type { Kategori, Line, LokasiRak, Satuan } from "@/generated/prisma/client";
 import { computeSparepartStatus } from "@/lib/status-helper";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { LINES } from "./line-config";
@@ -30,12 +34,32 @@ type SparepartGridProps = {
     // Pesan error dari Server Action kalau fetch di page.tsx gagal.
     // undefined kalau fetch sukses.
     fetchError?: string;
+    // Opsi dropdown untuk edit inline relasi — dikirim dari page.tsx
+    // supaya tidak perlu fetch ulang di client.
+    kategoriOptions: Kategori[];
+    satuanOptions: Satuan[];
+    lokasiRakOptions: LokasiRak[];
 };
 
-// Lebar eksplisit untuk 2 kolom sticky, dipakai juga untuk menghitung
-// offset `left` kolom kedua supaya persis menempel di kolom pertama.
-const ITEM_CODE_WIDTH = 150;
-const PART_WIDTH = 220;
+// ==========================================================
+// LEBAR KOLOM (px) — dipusatkan di sini supaya mudah disesuaikan.
+// Dipakai oleh <colgroup> untuk memaksa table-layout: fixed,
+// sehingga lebar kolom tidak dipengaruhi panjang konten sel.
+// ==========================================================
+const ITEM_CODE_WIDTH = 150; // sticky kolom-1
+const PART_WIDTH = 220;      // sticky kolom-2
+const KATEGORI_WIDTH = 120;
+const SPEK_WIDTH = 220;
+const SATUAN_WIDTH = 90;
+const LOKASI_RAK_WIDTH = 130;
+const STOK_COL_WIDTH = 72;   // sub-kolom Stok per line
+const OPNAME_COL_WIDTH = 88; // sub-kolom Opname per line
+const MIN_COL_WIDTH = 65;    // sub-kolom Min per line
+const STATUS_WIDTH = 110;
+const KETERANGAN_WIDTH = 175;
+
+// Lebar total untuk 1 line (3 sub-kolom).
+const LINE_COL_WIDTH = STOK_COL_WIDTH + OPNAME_COL_WIDTH + MIN_COL_WIDTH;
 
 function formatTanggalOpname(date: Date | null): string {
     if (!date) return "-";
@@ -47,8 +71,6 @@ function formatTanggalOpname(date: Date | null): string {
 }
 
 // Ambil nilai unik & non-kosong dari suatu daftar field, diurutkan alfabet.
-// Dipakai untuk mengisi opsi checkbox Kategori/Satuan/Lokasi Rak di popup
-// filter secara DINAMIS dari data, bukan hardcode.
 function uniqueSorted(values: (string | null | undefined)[]): string[] {
     const set = new Set(values.filter((v): v is string => Boolean(v)));
     return Array.from(set).sort((a, b) => a.localeCompare(b));
@@ -74,6 +96,13 @@ const tdBase =
 // re-render (mis. tiap kali ketik di search box) — kalau didefinisikan
 // di dalam, semua sel edit akan remount & kehilangan fokus/state tiap
 // re-render induknya.
+//
+// DESAIN FLOATING PANEL:
+// Edit panel dirender sebagai `position: absolute` dari dalam td yang
+// punya `position: relative`. Panel mengambang DI ATAS baris tabel —
+// lebar kolom tidak berubah saat mode edit aktif.
+// Tombol Simpan/Batal berada di bawah input (bukan sejajar), supaya
+// kolom sempit pun tetap nyaman dipakai.
 // ==========================================================
 
 type InlineEditSubmitResult =
@@ -87,8 +116,9 @@ type EditTriggerProps = {
     onClick: () => void;
 };
 
-// Tombol transparan pembungkus tampilan normal sel yang bisa diedit —
-// cuma penanda visual (hover + tooltip) + pemicu masuk mode edit.
+// Tombol transparan pembungkus tampilan normal sel yang bisa diedit.
+// `overflow-hidden` + inner `truncate` memastikan teks panjang tidak
+// melebarkan kolom — terpotong dengan ellipsis di batas lebar kolom.
 function EditTrigger({ children, align = "left", onClick }: EditTriggerProps) {
     const alignClass =
         align === "center" ? "text-center" : align === "right" ? "text-right" : "text-left";
@@ -97,9 +127,9 @@ function EditTrigger({ children, align = "left", onClick }: EditTriggerProps) {
             type="button"
             onClick={onClick}
             title="Klik untuk edit"
-            className={`-mx-1 -my-0.5 block w-full rounded px-1 py-0.5 ${alignClass} hover:bg-ink/5 focus:outline-none focus:ring-1 focus:ring-primary/30`}
+            className={`-mx-1 -my-0.5 block w-full overflow-hidden rounded px-1 py-0.5 ${alignClass} hover:bg-ink/5 focus:outline-none focus:ring-1 focus:ring-primary/30`}
         >
-            {children}
+            <span className="block truncate">{children}</span>
         </button>
     );
 }
@@ -107,21 +137,29 @@ function EditTrigger({ children, align = "left", onClick }: EditTriggerProps) {
 type InlineEditShellProps = {
     initialValue: string;
     inputType?: "text" | "number";
+    /**
+     * Kalau true, gunakan <textarea> (mis. Spesifikasi) supaya teks
+     * panjang bisa diedit dengan nyaman. Enter saja tidak simpan —
+     * harus klik Simpan atau tekan Ctrl+Enter.
+     */
+    useTextarea?: boolean;
     /** Label kecil di atas input, mis. "Selisih (+/-)" untuk koreksi stok. */
     label?: string;
     placeholder?: string;
-    /** Dipanggil saat Batal, Escape, blur ke luar sel, ATAU setelah Simpan sukses. */
+    /** Dipanggil saat Batal, Escape, blur ke luar panel, atau setelah simpan sukses. */
     onClose: () => void;
     onSubmit: (value: string) => Promise<InlineEditSubmitResult>;
 };
 
-// Shell umum untuk semua mode edit inline: input di dalam sel + tombol
-// Simpan (check hijau)/Batal (X abu-abu) menempel di kanan input, Enter =
-// simpan, Escape = batal, klik di luar (blur) = batal, error tampil kecil
-// di bawah input tanpa menutup mode edit.
+// Panel edit mengambang — diposisikan absolut dari sudut kiri-atas td
+// (td harus punya `position: relative`). Tombol Simpan & Batal ada di
+// bawah input, bukan sejajar, supaya kolom sempit tetap rapi.
+// `tabIndex={-1}` pada panel memastikan klik pada area kosong panel
+// tidak menutupnya (relatedTarget = panel itu sendiri, masih "di dalam").
 function InlineEditShell({
     initialValue,
     inputType = "text",
+    useTextarea = false,
     label,
     placeholder,
     onClose,
@@ -145,82 +183,355 @@ function InlineEditShell({
             setIsSaving(false);
             setError(result.message);
         } else {
-            // "cancelled" — mis. window.prompt() alasan koreksi dibatalkan/
-            // dikosongkan. Diam-diam batal, sel tetap dalam mode edit,
-            // tidak ada pesan error.
+            // "cancelled" — mis. window.prompt() alasan koreksi dibatalkan.
+            // Diam-diam batal, panel tetap terbuka, tidak ada pesan error.
             setIsSaving(false);
         }
     }
 
     return (
         <div
-            className="relative flex w-full items-center gap-1"
+            // tabIndex={-1} supaya klik area kosong panel tidak trigger blur
+            // keluar → relatedTarget = div ini sendiri → masih "di dalam".
+            tabIndex={-1}
+            className="absolute left-0 top-0 z-50 w-max min-w-[190px] max-w-[300px] rounded-lg border border-primary/30 bg-surface p-2.5 shadow-xl ring-1 ring-primary/10 focus:outline-none"
             onBlur={(event) => {
-                const next = event.relatedTarget;
-                if (!(next instanceof Node) || !event.currentTarget.contains(next)) {
+                const related = event.relatedTarget;
+                if (
+                    !(related instanceof Node) ||
+                    !event.currentTarget.contains(related)
+                ) {
                     onClose();
                 }
             }}
         >
-            <div className="flex w-full min-w-0 flex-col">
-                {label && (
-                    <span className="mb-0.5 font-sans text-[10px] leading-none text-muted">
-                        {label}
-                    </span>
-                )}
-                <input
-                    type={inputType}
+            {label && (
+                <span className="mb-1 block font-sans text-[10px] font-semibold uppercase tracking-wide text-primary/70">
+                    {label}
+                </span>
+            )}
+            {useTextarea ? (
+                <textarea
                     autoFocus
+                    rows={3}
                     value={draft}
                     placeholder={placeholder}
                     disabled={isSaving}
-                    onChange={(event) => setDraft(event.target.value)}
-                    onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                            event.preventDefault();
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                        // Escape = batal. Ctrl/Cmd+Enter = simpan.
+                        // Enter biasa = newline di textarea (tidak simpan).
+                        if (e.key === "Escape") { e.preventDefault(); onClose(); }
+                        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                            e.preventDefault();
                             handleSave();
-                        } else if (event.key === "Escape") {
-                            event.preventDefault();
-                            onClose();
                         }
                     }}
-                    className="w-full min-w-0 rounded border border-ink/20 bg-app-bg px-1.5 py-0.5 font-sans text-sm text-ink focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/30 disabled:opacity-60"
+                    className="w-full resize-y rounded border border-ink/20 bg-app-bg px-2 py-1 font-sans text-sm text-ink focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/30 disabled:opacity-60"
                 />
-            </div>
-
-            <button
-                type="button"
-                onClick={handleSave}
-                disabled={isSaving}
-                aria-label="Simpan"
-                className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-status-safe hover:bg-status-safe/10 disabled:opacity-60"
-            >
-                {isSaving ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                    <Check className="h-3.5 w-3.5" />
-                )}
-            </button>
-            <button
-                type="button"
-                onClick={onClose}
-                disabled={isSaving}
-                aria-label="Batal"
-                className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted hover:bg-ink/5 disabled:opacity-60"
-            >
-                <X className="h-3.5 w-3.5" />
-            </button>
+            ) : (
+                <input
+                    autoFocus
+                    type={inputType}
+                    value={draft}
+                    placeholder={placeholder}
+                    disabled={isSaving}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                        if (e.key === "Enter") { e.preventDefault(); handleSave(); }
+                        if (e.key === "Escape") { e.preventDefault(); onClose(); }
+                    }}
+                    className="w-full rounded border border-ink/20 bg-app-bg px-2 py-1 font-sans text-sm text-ink focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/30 disabled:opacity-60"
+                />
+            )}
 
             {error && (
-                <span className="absolute left-0 top-full z-20 mt-0.5 whitespace-nowrap font-sans text-[11px] text-status-danger">
-                    {error}
-                </span>
+                <p className="mt-1 font-sans text-[11px] text-status-danger">{error}</p>
             )}
+
+            <div className="mt-2 flex justify-end gap-1.5">
+                <button
+                    type="button"
+                    onClick={onClose}
+                    disabled={isSaving}
+                    className="flex items-center gap-1 rounded px-2 py-0.5 font-sans text-xs text-muted hover:bg-ink/5 disabled:opacity-60"
+                >
+                    <X className="h-3 w-3" />
+                    Batal
+                </button>
+                <button
+                    type="button"
+                    onClick={handleSave}
+                    disabled={isSaving}
+                    className="flex items-center gap-1 rounded bg-primary/10 px-2 py-0.5 font-sans text-xs font-medium text-primary hover:bg-primary/20 disabled:opacity-60"
+                >
+                    {isSaving ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                        <Check className="h-3 w-3" />
+                    )}
+                    Simpan
+                </button>
+            </div>
         </div>
     );
 }
 
-export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
+// Shell khusus untuk Edit Stok (Koreksi). Menggantikan window.prompt()
+// supaya tidak trigger onBlur yang menutup panel secara paksa.
+//
+// UX: input NUMBER berisi nilai stok saat ini (bukan delta kosong) —
+// user langsung mengedit ke angka final yang diinginkan. Delta ke server
+// baru dihitung saat Simpan: (nilai baru) - (currentValue, yaitu nilai
+// stok sebelum sel ini dibuka untuk diedit). onSubmit tetap menerima
+// delta (string) supaya sisi caller (submitStokField -> recordStockMovement)
+// tidak perlu berubah sama sekali — fungsi itu memang kontraknya delta.
+type InlineStockEditShellProps = {
+    /** Nilai stok saat ini untuk line ini, dipakai untuk prefill input & basis hitung delta. */
+    currentValue: number;
+    onClose: () => void;
+    onSubmit: (delta: string, keterangan: string) => Promise<InlineEditSubmitResult>;
+};
+
+function InlineStockEditShell({ currentValue, onClose, onSubmit }: InlineStockEditShellProps) {
+    const [draft, setDraft] = useState(String(currentValue));
+    const [keterangan, setKeterangan] = useState("");
+    const [isSaving, setIsSaving] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    async function handleSave() {
+        if (isSaving) return;
+
+        const trimmed = draft.trim();
+        const newValue = Number(trimmed);
+        if (trimmed === "" || Number.isNaN(newValue)) {
+            setError("Masukkan angka yang valid");
+            return;
+        }
+
+        const delta = newValue - currentValue;
+
+        // User tidak benar-benar mengubah angkanya — tidak perlu panggil
+        // Server Action sama sekali, cukup anggap tidak ada perubahan dan
+        // tutup mode edit. Alasan koreksi juga tidak perlu divalidasi di
+        // sini karena tidak ada apa pun yang dikirim ke server.
+        if (delta === 0) {
+            onClose();
+            return;
+        }
+
+        if (!keterangan.trim()) {
+            setError("Alasan wajib diisi");
+            return;
+        }
+
+        setIsSaving(true);
+        setError(null);
+
+        const result = await onSubmit(String(delta), keterangan);
+
+        if (result.status === "success") {
+            setIsSaving(false);
+            onClose();
+        } else if (result.status === "error") {
+            setIsSaving(false);
+            setError(result.message);
+        } else {
+            setIsSaving(false);
+        }
+    }
+
+    return (
+        <div
+            tabIndex={-1}
+            className="absolute left-0 top-0 z-50 w-max min-w-[220px] max-w-[300px] rounded-lg border border-primary/30 bg-surface p-2.5 shadow-xl ring-1 ring-primary/10 focus:outline-none"
+            onBlur={(event) => {
+                const related = event.relatedTarget;
+                if (
+                    !(related instanceof Node) ||
+                    !event.currentTarget.contains(related)
+                ) {
+                    onClose();
+                }
+            }}
+        >
+            <input
+                autoFocus
+                type="number"
+                value={draft}
+                disabled={isSaving}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                    if (e.key === "Enter") { e.preventDefault(); handleSave(); }
+                    if (e.key === "Escape") { e.preventDefault(); onClose(); }
+                }}
+                className="mb-2 w-full rounded border border-ink/20 bg-app-bg px-2 py-1 font-sans text-sm text-ink focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/30 disabled:opacity-60"
+            />
+
+            <span className="mb-1 block font-sans text-[10px] font-semibold uppercase tracking-wide text-primary/70">
+                Alasan Koreksi
+            </span>
+            <textarea
+                rows={2}
+                value={keterangan}
+                placeholder="Alasan wajib diisi..."
+                disabled={isSaving}
+                onChange={(e) => setKeterangan(e.target.value)}
+                onKeyDown={(e) => {
+                    if (e.key === "Escape") { e.preventDefault(); onClose(); }
+                    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                        e.preventDefault();
+                        handleSave();
+                    }
+                }}
+                className="w-full resize-y rounded border border-ink/20 bg-app-bg px-2 py-1 font-sans text-sm text-ink focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/30 disabled:opacity-60"
+            />
+
+            {error && (
+                <p className="mt-1 font-sans text-[11px] text-status-danger">{error}</p>
+            )}
+
+            <div className="mt-2 flex justify-end gap-1.5">
+                <button
+                    type="button"
+                    onClick={onClose}
+                    disabled={isSaving}
+                    className="flex items-center gap-1 rounded px-2 py-0.5 font-sans text-xs text-muted hover:bg-ink/5 disabled:opacity-60"
+                >
+                    <X className="h-3 w-3" />
+                    Batal
+                </button>
+                <button
+                    type="button"
+                    onClick={handleSave}
+                    disabled={isSaving}
+                    className="flex items-center gap-1 rounded bg-primary/10 px-2 py-0.5 font-sans text-xs font-medium text-primary hover:bg-primary/20 disabled:opacity-60"
+                >
+                    {isSaving ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                        <Check className="h-3 w-3" />
+                    )}
+                    Simpan
+                </button>
+            </div>
+        </div>
+    );
+}
+
+// Shell khusus untuk edit inline berupa <select> (dropdown) — dipakai untuk
+// Kategori, Satuan, dan Lokasi Rak. Pola Simpan/Batal identik dengan
+// InlineEditShell supaya tampilan konsisten.
+type SelectOption = { value: string | null; label: string };
+type InlineSelectShellProps = {
+    initialValue: string | null;
+    options: SelectOption[];
+    onClose: () => void;
+    onSubmit: (value: string | null) => Promise<InlineEditSubmitResult>;
+};
+
+function InlineSelectShell({
+    initialValue,
+    options,
+    onClose,
+    onSubmit,
+}: InlineSelectShellProps) {
+    // Sentinel string untuk opsi "null" di dalam <select> (value harus string).
+    const NULL_SENTINEL = "__NULL__";
+
+    const [draft, setDraft] = useState<string>(initialValue ?? NULL_SENTINEL);
+    const [isSaving, setIsSaving] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    async function handleSave() {
+        if (isSaving) return;
+        setIsSaving(true);
+        setError(null);
+
+        const value = draft === NULL_SENTINEL ? null : draft;
+        const result = await onSubmit(value);
+
+        if (result.status === "success") {
+            setIsSaving(false);
+            onClose();
+        } else if (result.status === "error") {
+            setIsSaving(false);
+            setError(result.message);
+        } else {
+            setIsSaving(false);
+        }
+    }
+
+    return (
+        <div
+            tabIndex={-1}
+            className="absolute left-0 top-0 z-50 w-max min-w-[190px] max-w-[280px] rounded-lg border border-primary/30 bg-surface p-2.5 shadow-xl ring-1 ring-primary/10 focus:outline-none"
+            onBlur={(event) => {
+                const related = event.relatedTarget;
+                if (
+                    !(related instanceof Node) ||
+                    !event.currentTarget.contains(related)
+                ) {
+                    onClose();
+                }
+            }}
+        >
+            <select
+                autoFocus
+                value={draft}
+                disabled={isSaving}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                    if (e.key === "Escape") { e.preventDefault(); onClose(); }
+                }}
+                className="w-full rounded border border-ink/20 bg-app-bg px-2 py-1 font-sans text-sm text-ink focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/30 disabled:opacity-60"
+            >
+                {options.map((opt) => (
+                    <option key={opt.value ?? NULL_SENTINEL} value={opt.value ?? NULL_SENTINEL}>
+                        {opt.label}
+                    </option>
+                ))}
+            </select>
+
+            {error && (
+                <p className="mt-1 font-sans text-[11px] text-status-danger">{error}</p>
+            )}
+
+            <div className="mt-2 flex justify-end gap-1.5">
+                <button
+                    type="button"
+                    onClick={onClose}
+                    disabled={isSaving}
+                    className="flex items-center gap-1 rounded px-2 py-0.5 font-sans text-xs text-muted hover:bg-ink/5 disabled:opacity-60"
+                >
+                    <X className="h-3 w-3" />
+                    Batal
+                </button>
+                <button
+                    type="button"
+                    onClick={handleSave}
+                    disabled={isSaving}
+                    className="flex items-center gap-1 rounded bg-primary/10 px-2 py-0.5 font-sans text-xs font-medium text-primary hover:bg-primary/20 disabled:opacity-60"
+                >
+                    {isSaving ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                        <Check className="h-3 w-3" />
+                    )}
+                    Simpan
+                </button>
+            </div>
+        </div>
+    );
+}
+
+export function SparepartGrid({
+    initialData,
+    fetchError,
+    kategoriOptions,
+    satuanOptions,
+    lokasiRakOptions,
+}: SparepartGridProps) {
     // Salinan lokal initialData — di-mutasi optimis setelah edit inline
     // berhasil, supaya tampilan tabel ter-update tanpa reload halaman.
     // Di-resync kalau initialData dari parent berubah (mis. setelah
@@ -241,18 +552,17 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
     // dan sel lama otomatis kembali ke mode tampilan biasa.
     const [editingCellId, setEditingCellId] = useState<string | null>(null);
 
-    // Opsi checkbox Kategori/Satuan/Lokasi Rak diturunkan dinamis dari
-    // data, jadi otomatis ikut bertambah kalau ada kategori/satuan/
-    // lokasi rak baru tanpa perlu ubah kode di sini.
-    const kategoriOptions = useMemo(
+    // Opsi checkbox filter Kategori/Satuan/Lokasi Rak — diturunkan dinamis
+    // dari data yang sudah ada, bukan dari props dropdown.
+    const filterKategoriOptions = useMemo(
         () => uniqueSorted(data.map((s) => s.kategori.nama)),
         [data]
     );
-    const satuanOptions = useMemo(
+    const filterSatuanOptions = useMemo(
         () => uniqueSorted(data.map((s) => s.satuan.nama)),
         [data]
     );
-    const lokasiRakOptions = useMemo(
+    const filterLokasiRakOptions = useMemo(
         () => uniqueSorted(data.map((s) => s.lokasiRak?.nama)),
         [data]
     );
@@ -330,6 +640,19 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
             ? LINES.filter((line) => appliedFilters.line.includes(line.key))
             : LINES;
 
+    // Lebar total tabel — dihitung dinamis supaya scrollable container
+    // tahu berapa panjang tabel sebenarnya (berubah saat filter Line aktif).
+    const tableWidth =
+        ITEM_CODE_WIDTH +
+        PART_WIDTH +
+        KATEGORI_WIDTH +
+        SPEK_WIDTH +
+        SATUAN_WIDTH +
+        LOKASI_RAK_WIDTH +
+        visibleLines.length * LINE_COL_WIDTH +
+        STATUS_WIDTH +
+        KETERANGAN_WIDTH;
+
     // 6 kolom biasa (Item Code, Part, Kategori, Spek, Satuan, Lokasi Rak)
     // + (jumlah line yang tampil x 3 sub-kolom) + Status + Keterangan
     const totalColumns = 6 + visibleLines.length * 3 + 2;
@@ -343,19 +666,15 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
             : "Belum ada data sparepart";
 
     // --- Merge hasil edit ke state lokal tanpa refetch/reload ---
+    //
+    // Semua handler menerima SparepartWithRelations lengkap dari server
+    // dan menggantikan baris lama di array state — ini satu-satunya sumber
+    // kebenaran setelah edit. Tidak ada merge field per field supaya
+    // relasi (kategori.nama, satuan.nama, lokasiRak.nama) ikut ter-update.
 
-    function mergeSparepartTextField(
-        sparepartId: string,
-        field: "namaPart" | "spesifikasi" | "keterangan",
-        value: string | null
-    ) {
+    function mergeSparepartRow(updated: SparepartWithRelations) {
         setData((prev) =>
-            prev.map((sp) => {
-                if (sp.id !== sparepartId) return sp;
-                if (field === "namaPart") return { ...sp, namaPart: value ?? "" };
-                if (field === "spesifikasi") return { ...sp, spesifikasi: value };
-                return { ...sp, keterangan: value };
-            })
+            prev.map((sp) => (sp.id === updated.id ? updated : sp))
         );
     }
 
@@ -383,8 +702,8 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
     }
 
     // --- Handler submit tiap jenis sel edit — dipanggil dari onSubmit
-    //     InlineEditShell, hasilnya menentukan shell tetap terbuka
-    //     (error/cancelled) atau tertutup (success). ---
+    //     InlineEditShell/InlineSelectShell, hasilnya menentukan panel
+    //     tetap terbuka (error/cancelled) atau tertutup (success). ---
 
     async function submitTextField(
         sparepartId: string,
@@ -395,14 +714,29 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
         if (!result.success) {
             return { status: "error", message: result.message };
         }
-        mergeSparepartTextField(sparepartId, field, result.data[field]);
+        // result.data adalah SparepartWithRelations lengkap — ganti seluruh baris.
+        mergeSparepartRow(result.data);
+        return { status: "success" };
+    }
+
+    async function submitRelationField(
+        sparepartId: string,
+        field: "kategoriId" | "satuanId" | "lokasiRakId",
+        value: string | null
+    ): Promise<InlineEditSubmitResult> {
+        const result = await updateSparepartRelation(sparepartId, field, value);
+        if (!result.success) {
+            return { status: "error", message: result.message };
+        }
+        mergeSparepartRow(result.data);
         return { status: "success" };
     }
 
     async function submitStokField(
         sparepartId: string,
         line: Line,
-        value: string
+        value: string,
+        keterangan: string
     ): Promise<InlineEditSubmitResult> {
         const trimmed = value.trim();
         const delta = Number(trimmed);
@@ -410,31 +744,54 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
             return { status: "error", message: "Masukkan angka selisih yang valid" };
         }
 
-        // KOREKSI wajib ada keterangan — minta alasan lewat prompt sederhana
-        // SETELAH validasi angka, SEBELUM benar-benar submit ke server.
-        const alasan = window.prompt("Alasan koreksi stok (wajib diisi):");
-        if (alasan === null) {
-            return { status: "cancelled" };
-        }
-        const alasanTrimmed = alasan.trim();
+        const alasanTrimmed = keterangan.trim();
         if (!alasanTrimmed) {
-            return { status: "cancelled" };
+            return { status: "error", message: "Alasan wajib diisi" };
         }
 
-        const result = await recordStockMovement({
-            sparepartId,
-            line,
-            tipe: "KOREKSI",
-            jumlah: delta,
-            keterangan: alasanTrimmed,
-        });
+        try {
+            const result = await recordStockMovement({
+                sparepartId,
+                line,
+                tipe: "KOREKSI",
+                jumlah: delta,
+                keterangan: alasanTrimmed,
+            });
 
-        if (!result.success) {
-            return { status: "error", message: result.message };
+            // DEBUG SEMENTARA — log response mentah dari Server Action supaya
+            // kegagalan yang selama ini "diam-diam" (tidak sampai ke UI)
+            // kelihatan di browser console. Hapus console.error ini setelah
+            // root cause dikonfirmasi tuntas.
+            console.error("[submitStokField] response:", result);
+
+            if (!result.success) {
+                return { status: "error", message: result.message };
+            }
+
+            // Gunakan lineStock dari response untuk update state — ini yang
+            // berisi nilai jumlah & lastOpnameDate terbaru dari database.
+            // Dicocokkan berdasarkan sparepartId (baris mana di tabel) DAN
+            // line (sub-kolom mana di dalam baris itu) lewat mergeLineStock.
+            mergeLineStock(sparepartId, result.data.lineStock, result.data.newTotalStok);
+            return { status: "success" };
+        } catch (error) {
+            // recordStockMovement pada dasarnya sudah membungkus errornya
+            // sendiri jadi { success: false, message }, TAPI kalau ada yang
+            // gagal DI LUAR jangkauan try/catch internalnya (mis. sesi auth
+            // bermasalah, error jaringan, atau exception lain yang benar-benar
+            // di-throw, bukan di-return) — sebelumnya di sini tidak ada
+            // try/catch sama sekali. Promise yang reject itu akan lolos ke
+            // handleSave() di InlineStockEditShell tanpa pernah ditangkap,
+            // tombol Simpan macet di status loading, dan tabel tidak pernah
+            // ter-update. Itu skenario yang paling cocok dengan bug "gagal
+            // diam-diam" ini — try/catch di bawah memastikan exception jenis
+            // apa pun tetap berakhir sebagai pesan error yang terlihat user.
+            console.error("[submitStokField] unexpected error:", error);
+            return {
+                status: "error",
+                message: "Terjadi kesalahan tak terduga saat menyimpan stok. Coba lagi.",
+            };
         }
-
-        mergeLineStock(sparepartId, result.data.lineStock, result.data.newTotalStok);
-        return { status: "success" };
     }
 
     async function submitMinField(
@@ -456,6 +813,23 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
         mergeLineStock(sparepartId, result.data.lineStock);
         return { status: "success" };
     }
+
+    // --- Siapkan opsi select untuk edit relasi ---
+
+    const selectKategoriOptions: SelectOption[] = kategoriOptions.map((k) => ({
+        value: k.id,
+        label: k.nama,
+    }));
+
+    const selectSatuanOptions: SelectOption[] = satuanOptions.map((s) => ({
+        value: s.id,
+        label: s.nama,
+    }));
+
+    const selectLokasiRakOptions: SelectOption[] = [
+        { value: null, label: "— Tidak ada —" },
+        ...lokasiRakOptions.map((l) => ({ value: l.id, label: l.nama })),
+    ];
 
     return (
         <div className="min-h-screen bg-app-bg p-6">
@@ -500,21 +874,47 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
                         onClose={() => setIsFilterOpen(false)}
                         appliedFilters={appliedFilters}
                         onApply={setAppliedFilters}
-                        kategoriOptions={kategoriOptions}
-                        satuanOptions={satuanOptions}
-                        lokasiRakOptions={lokasiRakOptions}
+                        kategoriOptions={filterKategoriOptions}
+                        satuanOptions={filterSatuanOptions}
+                        lokasiRakOptions={filterLokasiRakOptions}
                     />
                 </div>
             </div>
 
             <div className="overflow-x-auto rounded-lg border border-ink/20">
-                <table className="w-full min-w-[1400px] border-separate border-spacing-0 text-sm">
+                {/*
+                    table-fixed + colgroup: kolom punya lebar tetap, konten yang
+                    terlalu panjang terpotong (ellipsis) tanpa melebarkan kolom.
+                    Lebar tabel dihitung dinamis dari jumlah visibleLines supaya
+                    tidak ada kolom yang hilang atau kekecilan saat filter Line aktif.
+                */}
+                <table
+                    className="w-full border-separate border-spacing-0 text-sm [table-layout:fixed]"
+                    style={{ minWidth: tableWidth }}
+                >
+                    <colgroup>
+                        <col style={{ width: ITEM_CODE_WIDTH }} />
+                        <col style={{ width: PART_WIDTH }} />
+                        <col style={{ width: KATEGORI_WIDTH }} />
+                        <col style={{ width: SPEK_WIDTH }} />
+                        <col style={{ width: SATUAN_WIDTH }} />
+                        <col style={{ width: LOKASI_RAK_WIDTH }} />
+                        {visibleLines.map((line) => (
+                            <Fragment key={line.key}>
+                                <col style={{ width: STOK_COL_WIDTH }} />
+                                <col style={{ width: OPNAME_COL_WIDTH }} />
+                                <col style={{ width: MIN_COL_WIDTH }} />
+                            </Fragment>
+                        ))}
+                        <col style={{ width: STATUS_WIDTH }} />
+                        <col style={{ width: KETERANGAN_WIDTH }} />
+                    </colgroup>
+
                     <thead>
                         <tr>
                             {/* Item Code: sticky, kolom pertama */}
                             <th
                                 rowSpan={3}
-                                style={{ width: ITEM_CODE_WIDTH, minWidth: ITEM_CODE_WIDTH }}
                                 className={`${thBase} sticky left-0 z-10 text-center`}
                             >
                                 Item Code
@@ -522,11 +922,7 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
                             {/* Part: sticky, kolom kedua, nempel persis di kanan Item Code */}
                             <th
                                 rowSpan={3}
-                                style={{
-                                    width: PART_WIDTH,
-                                    minWidth: PART_WIDTH,
-                                    left: ITEM_CODE_WIDTH,
-                                }}
+                                style={{ left: ITEM_CODE_WIDTH }}
                                 className={`${thBase} sticky z-10 text-center`}
                             >
                                 Part
@@ -589,9 +985,16 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
                                 // Zebra stripe: baris genap = app-bg, baris ganjil = surface.
                                 const rowBg = idx % 2 === 0 ? "bg-app-bg" : "bg-surface";
 
+                                // ID sel edit — format konsisten supaya mudah dibandingkan.
                                 const namaPartCellId = `namaPart:${sparepart.id}`;
                                 const spesifikasiCellId = `spesifikasi:${sparepart.id}`;
                                 const keteranganCellId = `keterangan:${sparepart.id}`;
+                                const kategoriCellId = `kategori:${sparepart.id}`;
+                                const satuanCellId = `satuan:${sparepart.id}`;
+                                const lokasiRakCellId = `lokasiRak:${sparepart.id}`;
+
+                                const isEditingRow = editingCellId?.includes(`:${sparepart.id}`);
+                                const stickyZIndex = isEditingRow ? "z-40" : "z-10";
 
                                 return (
                                     <tr key={sparepart.id} className={rowBg}>
@@ -599,29 +1002,31 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
                                             supaya tidak transparan saat scroll horizontal.
                                             TIDAK bisa diedit inline (di luar scope). */}
                                         <td
-                                            style={{ width: ITEM_CODE_WIDTH, minWidth: ITEM_CODE_WIDTH }}
-                                            className={`${tdBase} ${rowBg} sticky left-0 z-10 text-center font-mono`}
+                                            className={`${tdBase} ${rowBg} sticky left-0 ${stickyZIndex} overflow-hidden text-center font-mono`}
                                         >
-                                            {sparepart.itemCode}
+                                            <span className="block truncate">{sparepart.itemCode}</span>
                                         </td>
-                                        {/* Part (namaPart): sticky, bg eksplisit sama seperti
-                                            Item Code, BISA diedit inline. */}
+
+                                        {/* Part (namaPart): sticky, BISA diedit inline.
+                                            td punya `relative` sebagai anchor floating panel. */}
                                         <td
-                                            style={{
-                                                width: PART_WIDTH,
-                                                minWidth: PART_WIDTH,
-                                                left: ITEM_CODE_WIDTH,
-                                            }}
-                                            className={`${tdBase} ${rowBg} sticky z-10 text-center`}
+                                            style={{ left: ITEM_CODE_WIDTH }}
+                                            className={`${tdBase} ${rowBg} relative sticky ${stickyZIndex} text-center`}
                                         >
                                             {editingCellId === namaPartCellId ? (
-                                                <InlineEditShell
-                                                    initialValue={sparepart.namaPart}
-                                                    onClose={() => setEditingCellId(null)}
-                                                    onSubmit={(value) =>
-                                                        submitTextField(sparepart.id, "namaPart", value)
-                                                    }
-                                                />
+                                                <>
+                                                    {/* Placeholder invisible supaya baris tidak collapse */}
+                                                    <span className="invisible select-none" aria-hidden>
+                                                        {sparepart.namaPart || "·"}
+                                                    </span>
+                                                    <InlineEditShell
+                                                        initialValue={sparepart.namaPart}
+                                                        onClose={() => setEditingCellId(null)}
+                                                        onSubmit={(value) =>
+                                                            submitTextField(sparepart.id, "namaPart", value)
+                                                        }
+                                                    />
+                                                </>
                                             ) : (
                                                 <EditTrigger
                                                     align="center"
@@ -631,18 +1036,50 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
                                                 </EditTrigger>
                                             )}
                                         </td>
-                                        {/* Kategori: TIDAK bisa diedit inline (di luar scope). */}
-                                        <td className={tdBase}>{sparepart.kategori.nama}</td>
-                                        {/* Spek (spesifikasi): BISA diedit inline. */}
-                                        <td className={tdBase}>
+
+                                        {/* Kategori: BISA diedit inline (dropdown). */}
+                                        <td className={`${tdBase} relative`}>
+                                            {editingCellId === kategoriCellId ? (
+                                                <>
+                                                    <span className="invisible select-none" aria-hidden>
+                                                        {sparepart.kategori.nama || "·"}
+                                                    </span>
+                                                    <InlineSelectShell
+                                                        initialValue={sparepart.kategoriId}
+                                                        options={selectKategoriOptions}
+                                                        onClose={() => setEditingCellId(null)}
+                                                        onSubmit={(value) =>
+                                                            submitRelationField(sparepart.id, "kategoriId", value)
+                                                        }
+                                                    />
+                                                </>
+                                            ) : (
+                                                <EditTrigger
+                                                    onClick={() => setEditingCellId(kategoriCellId)}
+                                                >
+                                                    {sparepart.kategori.nama}
+                                                </EditTrigger>
+                                            )}
+                                        </td>
+
+                                        {/* Spek (spesifikasi): BISA diedit inline.
+                                            Pakai textarea supaya teks panjang nyaman diedit. */}
+                                        <td className={`${tdBase} relative`}>
                                             {editingCellId === spesifikasiCellId ? (
-                                                <InlineEditShell
-                                                    initialValue={sparepart.spesifikasi ?? ""}
-                                                    onClose={() => setEditingCellId(null)}
-                                                    onSubmit={(value) =>
-                                                        submitTextField(sparepart.id, "spesifikasi", value)
-                                                    }
-                                                />
+                                                <>
+                                                    <span className="invisible select-none" aria-hidden>
+                                                        {sparepart.spesifikasi || "·"}
+                                                    </span>
+                                                    <InlineEditShell
+                                                        initialValue={sparepart.spesifikasi ?? ""}
+                                                        useTextarea
+                                                        placeholder="Ketik spesifikasi… (Ctrl+Enter untuk simpan)"
+                                                        onClose={() => setEditingCellId(null)}
+                                                        onSubmit={(value) =>
+                                                            submitTextField(sparepart.id, "spesifikasi", value)
+                                                        }
+                                                    />
+                                                </>
                                             ) : (
                                                 <EditTrigger
                                                     onClick={() => setEditingCellId(spesifikasiCellId)}
@@ -651,9 +1088,57 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
                                                 </EditTrigger>
                                             )}
                                         </td>
-                                        {/* Satuan & Lokasi Rak: TIDAK bisa diedit inline (di luar scope). */}
-                                        <td className={tdBase}>{sparepart.satuan.nama}</td>
-                                        <td className={tdBase}>{sparepart.lokasiRak?.nama ?? "-"}</td>
+
+                                        {/* Satuan: BISA diedit inline (dropdown). */}
+                                        <td className={`${tdBase} relative`}>
+                                            {editingCellId === satuanCellId ? (
+                                                <>
+                                                    <span className="invisible select-none" aria-hidden>
+                                                        {sparepart.satuan.nama || "·"}
+                                                    </span>
+                                                    <InlineSelectShell
+                                                        initialValue={sparepart.satuanId}
+                                                        options={selectSatuanOptions}
+                                                        onClose={() => setEditingCellId(null)}
+                                                        onSubmit={(value) =>
+                                                            submitRelationField(sparepart.id, "satuanId", value)
+                                                        }
+                                                    />
+                                                </>
+                                            ) : (
+                                                <EditTrigger
+                                                    onClick={() => setEditingCellId(satuanCellId)}
+                                                >
+                                                    {sparepart.satuan.nama}
+                                                </EditTrigger>
+                                            )}
+                                        </td>
+
+                                        {/* Lokasi Rak: BISA diedit inline (dropdown, nullable). */}
+                                        <td className={`${tdBase} relative`}>
+                                            {editingCellId === lokasiRakCellId ? (
+                                                <>
+                                                    <span className="invisible select-none" aria-hidden>
+                                                        {sparepart.lokasiRak?.nama ?? "-"}
+                                                    </span>
+                                                    <InlineSelectShell
+                                                        initialValue={sparepart.lokasiRakId ?? null}
+                                                        options={selectLokasiRakOptions}
+                                                        onClose={() => setEditingCellId(null)}
+                                                        onSubmit={(value) =>
+                                                            submitRelationField(sparepart.id, "lokasiRakId", value)
+                                                        }
+                                                    />
+                                                </>
+                                            ) : (
+                                                <EditTrigger
+                                                    onClick={() => setEditingCellId(lokasiRakCellId)}
+                                                >
+                                                    {sparepart.lokasiRak?.nama ?? "-"}
+                                                </EditTrigger>
+                                            )}
+                                        </td>
+
                                         {visibleLines.map((line) => {
                                             const lineStock = sparepart.lineStocks.find(
                                                 (ls) => ls.line === line.key
@@ -663,19 +1148,23 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
 
                                             return (
                                                 <Fragment key={line.key}>
-                                                    {/* Stok: BISA diedit inline (delta koreksi). */}
-                                                    <td className={`${tdBase} text-right`}>
+                                                    {/* Stok: BISA diedit inline — input diisi nilai stok saat ini,
+                                                        delta ke server dihitung otomatis saat Simpan (lihat
+                                                        InlineStockEditShell). */}
+                                                    <td className={`${tdBase} relative text-right`}>
                                                         {editingCellId === stokCellId ? (
-                                                            <InlineEditShell
-                                                                initialValue=""
-                                                                inputType="number"
-                                                                label="Selisih (+/-)"
-                                                                placeholder="mis. -3"
-                                                                onClose={() => setEditingCellId(null)}
-                                                                onSubmit={(value) =>
-                                                                    submitStokField(sparepart.id, line.key, value)
-                                                                }
-                                                            />
+                                                            <>
+                                                                <span className="invisible select-none" aria-hidden>
+                                                                    {lineStock ? lineStock.jumlah : "-"}
+                                                                </span>
+                                                                <InlineStockEditShell
+                                                                    currentValue={lineStock ? lineStock.jumlah : 0}
+                                                                    onClose={() => setEditingCellId(null)}
+                                                                    onSubmit={(delta, keterangan) =>
+                                                                        submitStokField(sparepart.id, line.key, delta, keterangan)
+                                                                    }
+                                                                />
+                                                            </>
                                                         ) : (
                                                             <EditTrigger
                                                                 align="right"
@@ -686,24 +1175,31 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
                                                         )}
                                                     </td>
                                                     {/* Opname: TIDAK bisa diedit manual (otomatis dari sistem). */}
-                                                    <td className={`${tdBase} text-center`}>
-                                                        {lineStock
-                                                            ? formatTanggalOpname(lineStock.lastOpnameDate)
-                                                            : "-"}
+                                                    <td className={`${tdBase} overflow-hidden text-center`}>
+                                                        <span className="block truncate">
+                                                            {lineStock
+                                                                ? formatTanggalOpname(lineStock.lastOpnameDate)
+                                                                : "-"}
+                                                        </span>
                                                     </td>
                                                     {/* Min: BISA diedit inline. */}
-                                                    <td className={`${tdBase} text-right`}>
+                                                    <td className={`${tdBase} relative text-right`}>
                                                         {editingCellId === minCellId ? (
-                                                            <InlineEditShell
-                                                                initialValue={String(
-                                                                    lineStock ? lineStock.minStok : 0
-                                                                )}
-                                                                inputType="number"
-                                                                onClose={() => setEditingCellId(null)}
-                                                                onSubmit={(value) =>
-                                                                    submitMinField(sparepart.id, line.key, value)
-                                                                }
-                                                            />
+                                                            <>
+                                                                <span className="invisible select-none" aria-hidden>
+                                                                    {lineStock ? lineStock.minStok : "-"}
+                                                                </span>
+                                                                <InlineEditShell
+                                                                    initialValue={String(
+                                                                        lineStock ? lineStock.minStok : 0
+                                                                    )}
+                                                                    inputType="number"
+                                                                    onClose={() => setEditingCellId(null)}
+                                                                    onSubmit={(value) =>
+                                                                        submitMinField(sparepart.id, line.key, value)
+                                                                    }
+                                                                />
+                                                            </>
                                                         ) : (
                                                             <EditTrigger
                                                                 align="right"
@@ -716,20 +1212,27 @@ export function SparepartGrid({ initialData, fetchError }: SparepartGridProps) {
                                                 </Fragment>
                                             );
                                         })}
-                                        {/* Status: TIDAK bisa diedit inline (di luar scope, dihitung otomatis). */}
+
+                                        {/* Status: TIDAK bisa diedit inline (dihitung otomatis). */}
                                         <td className={`${tdBase} text-center`}>
                                             <StatusBadge status={status} />
                                         </td>
+
                                         {/* Keterangan: BISA diedit inline. */}
-                                        <td className={tdBase}>
+                                        <td className={`${tdBase} relative`}>
                                             {editingCellId === keteranganCellId ? (
-                                                <InlineEditShell
-                                                    initialValue={sparepart.keterangan ?? ""}
-                                                    onClose={() => setEditingCellId(null)}
-                                                    onSubmit={(value) =>
-                                                        submitTextField(sparepart.id, "keterangan", value)
-                                                    }
-                                                />
+                                                <>
+                                                    <span className="invisible select-none" aria-hidden>
+                                                        {sparepart.keterangan ?? "-"}
+                                                    </span>
+                                                    <InlineEditShell
+                                                        initialValue={sparepart.keterangan ?? ""}
+                                                        onClose={() => setEditingCellId(null)}
+                                                        onSubmit={(value) =>
+                                                            submitTextField(sparepart.id, "keterangan", value)
+                                                        }
+                                                    />
+                                                </>
                                             ) : (
                                                 <EditTrigger
                                                     onClick={() => setEditingCellId(keteranganCellId)}

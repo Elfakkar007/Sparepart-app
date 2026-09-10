@@ -131,7 +131,7 @@ export async function updateSparepartField(
     sparepartId: string,
     field: UpdateSparepartFieldName,
     value: string
-): Promise<ActionResult<Sparepart>> {
+): Promise<ActionResult<SparepartWithRelations>> {
     let data: Prisma.SparepartUpdateInput;
 
     if (field === "namaPart") {
@@ -152,6 +152,52 @@ export async function updateSparepartField(
         const updated = await prisma.sparepart.update({
             where: { id: sparepartId },
             data,
+            include: sparepartInclude,
+        });
+        return { success: true, data: updated };
+    } catch (error) {
+        return toFriendlyError(error, "Gagal memperbarui data sparepart");
+    }
+}
+
+// ==========================================================
+// UPDATE RELASI (kategoriId / satuanId / lokasiRakId)
+//
+// Dipakai inline-edit sel Kategori, Satuan, Lokasi Rak. Hanya menerima
+// field yang benar-benar berupa foreign key di tabel Sparepart —
+// field teks bebas (namaPart, dst) ditangani updateSparepartField.
+// lokasiRakId boleh null karena field ini opsional; kategoriId dan
+// satuanId wajib diisi (ditolak di sini kalau null).
+// ==========================================================
+
+export type UpdateSparepartRelationField = "kategoriId" | "satuanId" | "lokasiRakId";
+
+export async function updateSparepartRelation(
+    sparepartId: string,
+    field: UpdateSparepartRelationField,
+    value: string | null
+): Promise<ActionResult<SparepartWithRelations>> {
+    if ((field === "kategoriId" || field === "satuanId") && !value) {
+        return { success: false, message: "Field ini tidak boleh kosong" };
+    }
+
+    let data: Prisma.SparepartUpdateInput;
+    if (field === "kategoriId") {
+        data = { kategori: { connect: { id: value! } } };
+    } else if (field === "satuanId") {
+        data = { satuan: { connect: { id: value! } } };
+    } else {
+        // lokasiRakId — null = hapus relasi (disconnect)
+        data = value
+            ? { lokasiRak: { connect: { id: value } } }
+            : { lokasiRak: { disconnect: true } };
+    }
+
+    try {
+        const updated = await prisma.sparepart.update({
+            where: { id: sparepartId },
+            data,
+            include: sparepartInclude,
         });
         return { success: true, data: updated };
     } catch (error) {
