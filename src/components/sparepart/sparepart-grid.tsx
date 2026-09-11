@@ -1,17 +1,22 @@
 "use client";
 
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { Filter, Check, X, Loader2 } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Filter, Check, X, Loader2, Trash2, Plus, FileSpreadsheet } from "lucide-react";
 import {
+    deleteSpareparts,
     updateSparepartField,
     updateSparepartRelation,
     type getSparepartList,
+    type SparepartSortBy,
 } from "@/lib/actions/sparepart";
 import { recordStockMovement, updateLineMinStok } from "@/lib/actions/stock-movement";
 import type { Kategori, Line, LokasiRak, Satuan } from "@/generated/prisma/client";
 import { computeSparepartStatus } from "@/lib/status-helper";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { LINES } from "./line-config";
+import { SmartFormModal } from "./smart-form-modal";
+import { ImportExcelModal } from "./import-excel-modal";
 import {
     EMPTY_FILTERS,
     FilterPopup,
@@ -46,6 +51,7 @@ type SparepartGridProps = {
 // Dipakai oleh <colgroup> untuk memaksa table-layout: fixed,
 // sehingga lebar kolom tidak dipengaruhi panjang konten sel.
 // ==========================================================
+const CHECKBOX_WIDTH = 48;   // sticky kolom-0 (checkbox select baris)
 const ITEM_CODE_WIDTH = 150; // sticky kolom-1
 const PART_WIDTH = 220;      // sticky kolom-2
 const KATEGORI_WIDTH = 120;
@@ -55,11 +61,17 @@ const LOKASI_RAK_WIDTH = 130;
 const STOK_COL_WIDTH = 72;   // sub-kolom Stok per line
 const OPNAME_COL_WIDTH = 88; // sub-kolom Opname per line
 const MIN_COL_WIDTH = 65;    // sub-kolom Min per line
-const STATUS_WIDTH = 110;
+const STATUS_WIDTH = 150; // dilebarkan dari 110 — teks status panjang (mis. "Restock L1, L2, L3") kepotong di 110px
 const KETERANGAN_WIDTH = 175;
 
 // Lebar total untuk 1 line (3 sub-kolom).
 const LINE_COL_WIDTH = STOK_COL_WIDTH + OPNAME_COL_WIDTH + MIN_COL_WIDTH;
+
+// Posisi `left` (px) tiap kolom sticky — dihitung dari kolom-kolom
+// sticky sebelumnya, supaya kalau lebar salah satu berubah, kolom
+// sticky di kanannya otomatis ikut bergeser tanpa perlu diutak-atik manual.
+const ITEM_CODE_LEFT = CHECKBOX_WIDTH;
+const PART_LEFT = CHECKBOX_WIDTH + ITEM_CODE_WIDTH;
 
 function formatTanggalOpname(date: Date | null): string {
     if (!date) return "-";
@@ -75,6 +87,17 @@ function uniqueSorted(values: (string | null | undefined)[]): string[] {
     const set = new Set(values.filter((v): v is string => Boolean(v)));
     return Array.from(set).sort((a, b) => a.localeCompare(b));
 }
+
+// Opsi dropdown "Urutkan:" di toolbar — value cocok dengan SparepartSortBy
+// dari sparepart.ts supaya tetap 1 sumber kebenaran. Urutan array ini
+// menentukan urutan tampil di <select>, "Terlama" ditaruh pertama karena
+// itu default-nya.
+const SORT_OPTIONS: { value: SparepartSortBy; label: string }[] = [
+    { value: "terlama", label: "Terlama" },
+    { value: "terbaru", label: "Terbaru" },
+    { value: "nama_asc", label: "Nama (A-Z)" },
+    { value: "nama_desc", label: "Nama (Z-A)" },
+];
 
 // Kelas dasar sel header & data. Border pakai ink dengan opacity rendah
 // supaya tipis, bukan hitam pekat. Sengaja cuma border-b + border-r (bukan
@@ -174,18 +197,30 @@ function InlineEditShell({
         setIsSaving(true);
         setError(null);
 
-        const result = await onSubmit(draft);
+        try {
+            const result = await onSubmit(draft);
 
-        if (result.status === "success") {
+            if (result.status === "success") {
+                setIsSaving(false);
+                onClose();
+            } else if (result.status === "error") {
+                setIsSaving(false);
+                setError(result.message);
+            } else {
+                // "cancelled" — mis. window.prompt() alasan koreksi dibatalkan.
+                // Diam-diam batal, panel tetap terbuka, tidak ada pesan error.
+                setIsSaving(false);
+            }
+        } catch (error) {
+            // Jaring pengaman kalau onSubmit (submitTextField / submitRelationField /
+            // submitMinField) melempar exception asli, bukan cuma mengembalikan
+            // { status: "error" } — tanpa ini, promise yang reject lolos begitu
+            // saja dan tombol Simpan macet loading permanen tanpa pesan ke user.
+            // Kelas masalah yang sama seperti yang sudah ditangani di
+            // submitStokField (lihat komentar di sana).
+            console.error("[InlineEditShell] unexpected error saat submit:", error);
             setIsSaving(false);
-            onClose();
-        } else if (result.status === "error") {
-            setIsSaving(false);
-            setError(result.message);
-        } else {
-            // "cancelled" — mis. window.prompt() alasan koreksi dibatalkan.
-            // Diam-diam batal, panel tetap terbuka, tidak ada pesan error.
-            setIsSaving(false);
+            setError("Terjadi kesalahan tak terduga saat menyimpan. Coba lagi.");
         }
     }
 
@@ -449,16 +484,27 @@ function InlineSelectShell({
         setError(null);
 
         const value = draft === NULL_SENTINEL ? null : draft;
-        const result = await onSubmit(value);
 
-        if (result.status === "success") {
+        try {
+            const result = await onSubmit(value);
+
+            if (result.status === "success") {
+                setIsSaving(false);
+                onClose();
+            } else if (result.status === "error") {
+                setIsSaving(false);
+                setError(result.message);
+            } else {
+                setIsSaving(false);
+            }
+        } catch (error) {
+            // Jaring pengaman kalau onSubmit (submitRelationField) melempar
+            // exception asli, bukan cuma mengembalikan { status: "error" } —
+            // kelas masalah yang sama seperti yang sudah ditangani di
+            // submitStokField (lihat komentar di sana).
+            console.error("[InlineSelectShell] unexpected error saat submit:", error);
             setIsSaving(false);
-            onClose();
-        } else if (result.status === "error") {
-            setIsSaving(false);
-            setError(result.message);
-        } else {
-            setIsSaving(false);
+            setError("Terjadi kesalahan tak terduga saat menyimpan. Coba lagi.");
         }
     }
 
@@ -525,6 +571,92 @@ function InlineSelectShell({
     );
 }
 
+// Modal konfirmasi hapus massal — custom (bukan window.confirm bawaan
+// browser), dipakai saat tombol "Hapus" di toolbar seleksi diklik.
+// Ditaruh di module scope (bukan di dalam SparepartGrid) supaya konsisten
+// dengan pola shell edit inline lainnya di atas.
+//
+// Overlay penuh + panel di tengah (bukan floating panel anchored seperti
+// FilterPopup/InlineEditShell) karena ini aksi destruktif yang butuh
+// perhatian penuh user — tapi tetap pakai token visual yang sama: rounded-lg,
+// border-ink/20, bg-surface, shadow-xl, ring-primary/10.
+type DeleteConfirmModalProps = {
+    count: number;
+    isDeleting: boolean;
+    error: string | null;
+    onCancel: () => void;
+    onConfirm: () => void;
+};
+
+function DeleteConfirmModal({
+    count,
+    isDeleting,
+    error,
+    onCancel,
+    onConfirm,
+}: DeleteConfirmModalProps) {
+    return (
+        <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4"
+            onMouseDown={(event) => {
+                // Klik di backdrop (bukan di panel-nya) = batal. Diabaikan
+                // kalau sedang proses hapus supaya tidak ke-cancel di
+                // tengah request yang masih berjalan.
+                if (event.target === event.currentTarget && !isDeleting) {
+                    onCancel();
+                }
+            }}
+        >
+            <div
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="delete-confirm-title"
+                className="w-full max-w-sm rounded-lg border border-ink/20 bg-surface p-4 shadow-xl ring-1 ring-primary/10"
+            >
+                <h2
+                    id="delete-confirm-title"
+                    className="font-sans text-sm font-semibold text-ink"
+                >
+                    Hapus {count} part?
+                </h2>
+                <p className="mt-1.5 font-sans text-sm text-muted">
+                    Yakin ingin menghapus {count} part? Aksi ini tidak bisa dibatalkan.
+                </p>
+
+                {error && (
+                    <p className="mt-3 rounded border border-status-danger/30 bg-status-danger/10 px-2.5 py-1.5 font-sans text-xs text-status-danger">
+                        {error}
+                    </p>
+                )}
+
+                <div className="mt-4 flex justify-end gap-2">
+                    <button
+                        type="button"
+                        onClick={onCancel}
+                        disabled={isDeleting}
+                        className="rounded px-3 py-1.5 font-sans text-sm text-muted hover:bg-ink/5 disabled:opacity-60"
+                    >
+                        Batal
+                    </button>
+                    <button
+                        type="button"
+                        onClick={onConfirm}
+                        disabled={isDeleting}
+                        className="flex items-center gap-1.5 rounded bg-status-danger px-3 py-1.5 font-sans text-sm font-medium text-white hover:bg-status-danger/90 disabled:opacity-60"
+                    >
+                        {isDeleting ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                            <Trash2 className="h-3.5 w-3.5" />
+                        )}
+                        Hapus
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
 export function SparepartGrid({
     initialData,
     fetchError,
@@ -532,10 +664,13 @@ export function SparepartGrid({
     satuanOptions,
     lokasiRakOptions,
 }: SparepartGridProps) {
+    const router = useRouter();
+
     // Salinan lokal initialData — di-mutasi optimis setelah edit inline
     // berhasil, supaya tampilan tabel ter-update tanpa reload halaman.
     // Di-resync kalau initialData dari parent berubah (mis. setelah
-    // router.refresh() di tempat lain).
+    // router.refresh() di tempat lain — termasuk setelah submit smart
+    // form sukses, lihat handleSmartFormSuccess di bawah).
     const [data, setData] = useState(initialData);
     useEffect(() => {
         setData(initialData);
@@ -545,12 +680,36 @@ export function SparepartGrid({
     const [appliedFilters, setAppliedFilters] = useState<SparepartFilters>(EMPTY_FILTERS);
     const [isFilterOpen, setIsFilterOpen] = useState(false);
 
+    // Urutan tampil grid — murni state client, TIDAK memicu fetch ulang ke
+    // server. Default "terlama" mengikuti default baru getSparepartList di
+    // server (dipakai saat load awal); di sini cuma dipakai untuk sort
+    // ULANG data yang sudah ada di memory saat user ganti pilihan.
+    const [sortBy, setSortBy] = useState<SparepartSortBy>("terlama");
+
+    // Modal "+ Tambah / Restock" (smart form) — dipasang/dilepas dari DOM
+    // tiap buka/tutup (bukan cuma disembunyikan), supaya SmartFormModal
+    // selalu fetch ulang data master & mulai dari state kosong tiap dibuka.
+    const [isSmartFormOpen, setIsSmartFormOpen] = useState(false);
+
+    // Modal "Import Excel" — sama seperti smart form, dipasang/dilepas
+    // dari DOM tiap buka/tutup supaya ImportExcelModal selalu mulai dari
+    // tahap "upload" & state kosong tiap dibuka ulang.
+    const [isImportExcelOpen, setIsImportExcelOpen] = useState(false);
+
     // ID sel yang sedang dalam mode edit, format `${jenis}:${sparepartId}`
     // atau `${jenis}:${sparepartId}:${line}` untuk kolom per-line. Cuma
     // ada 1 nilai (bukan Set) — makanya otomatis cuma 1 sel yang bisa
     // edit dalam satu waktu: begitu sel lain diklik, nilai ini diganti
     // dan sel lama otomatis kembali ke mode tampilan biasa.
     const [editingCellId, setEditingCellId] = useState<string | null>(null);
+
+    // ID sparepart yang tercentang lewat checkbox select di grid — dipakai
+    // untuk aksi hapus massal. Set, bukan array, supaya cek "apakah id ini
+    // tercentang" (dipanggil tiap render tiap baris) O(1).
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+    const [isDeleting, setIsDeleting] = useState(false);
+    const [deleteError, setDeleteError] = useState<string | null>(null);
 
     // Opsi checkbox filter Kategori/Satuan/Lokasi Rak — diturunkan dinamis
     // dari data yang sudah ada, bukan dari props dropdown.
@@ -632,6 +791,37 @@ export function SparepartGrid({
         });
     }, [data, searchQuery, appliedFilters]);
 
+    // Sort DI CLIENT dari filteredData (search/filter dulu, baru sort hasil
+    // yang ketampil) — data lengkap sudah ada di memory (`data`), jadi
+    // ganti pilihan sort tidak perlu fetch ulang ke server, langsung instan.
+    // `[...filteredData]` supaya .sort() (in-place) tidak memutasi array
+    // hasil useMemo filteredData.
+    const sortedData = useMemo(() => {
+        const arr = [...filteredData];
+        switch (sortBy) {
+            case "nama_asc":
+                arr.sort((a, b) => a.namaPart.localeCompare(b.namaPart));
+                break;
+            case "nama_desc":
+                arr.sort((a, b) => b.namaPart.localeCompare(a.namaPart));
+                break;
+            case "terbaru":
+                arr.sort(
+                    (a, b) =>
+                        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+                );
+                break;
+            case "terlama":
+            default:
+                arr.sort(
+                    (a, b) =>
+                        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+                );
+                break;
+        }
+        return arr;
+    }, [filteredData, sortBy]);
+
     // Kalau filter Line aktif (ada yang dicentang), kolom grup "Stok" cuma
     // menampilkan sub-kolom line yang dicentang itu. Kolom lain (Item Code
     // s/d Lokasi Rak, Status, Keterangan) selalu tampil apapun filternya.
@@ -643,6 +833,7 @@ export function SparepartGrid({
     // Lebar total tabel — dihitung dinamis supaya scrollable container
     // tahu berapa panjang tabel sebenarnya (berubah saat filter Line aktif).
     const tableWidth =
+        CHECKBOX_WIDTH +
         ITEM_CODE_WIDTH +
         PART_WIDTH +
         KATEGORI_WIDTH +
@@ -653,9 +844,16 @@ export function SparepartGrid({
         STATUS_WIDTH +
         KETERANGAN_WIDTH;
 
-    // 6 kolom biasa (Item Code, Part, Kategori, Spek, Satuan, Lokasi Rak)
-    // + (jumlah line yang tampil x 3 sub-kolom) + Status + Keterangan
-    const totalColumns = 6 + visibleLines.length * 3 + 2;
+    // Checkbox + 6 kolom biasa (Item Code, Part, Kategori, Spek, Satuan,
+    // Lokasi Rak) + (jumlah line yang tampil x 3 sub-kolom) + Status + Keterangan
+    const totalColumns = 1 + 6 + visibleLines.length * 3 + 2;
+
+    // Select-all merujuk HANYA ke baris yang sedang terlihat (hasil
+    // search/filter, urutan tampil ikut sortedData) — bukan ke seluruh
+    // data mentah.
+    const visibleIds = sortedData.map((sp) => sp.id);
+    const isAllVisibleSelected =
+        visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
 
     const activeFilterCount = countActiveFilters(appliedFilters);
     const isFilterActive = activeFilterCount > 0;
@@ -699,6 +897,108 @@ export function SparepartGrid({
                 };
             })
         );
+    }
+
+    // --- Selection (checkbox) & hapus massal ---
+
+    function toggleSelectOne(id: string) {
+        setSelectedIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) {
+                next.delete(id);
+            } else {
+                next.add(id);
+            }
+            return next;
+        });
+    }
+
+    // Centang/lepas HANYA baris yang sedang terlihat (visibleIds) — id yang
+    // sebelumnya tercentang tapi sekarang tersembunyi karena search/filter
+    // dibiarkan apa adanya, tidak disentuh oleh select-all.
+    function toggleSelectAllVisible() {
+        setSelectedIds((prev) => {
+            const next = new Set(prev);
+            if (isAllVisibleSelected) {
+                visibleIds.forEach((id) => next.delete(id));
+            } else {
+                visibleIds.forEach((id) => next.add(id));
+            }
+            return next;
+        });
+    }
+
+    function openDeleteModal() {
+        setDeleteError(null);
+        setIsDeleteModalOpen(true);
+    }
+
+    function closeDeleteModal() {
+        if (isDeleting) return; // jangan biarkan batal di tengah proses hapus
+        setIsDeleteModalOpen(false);
+        setDeleteError(null);
+    }
+
+    async function handleConfirmDelete() {
+        if (isDeleting) return;
+        setIsDeleting(true);
+        setDeleteError(null);
+
+        try {
+            const idsToDelete = Array.from(selectedIds);
+            const result = await deleteSpareparts(idsToDelete);
+
+            if (!result.success) {
+                setIsDeleting(false);
+                setDeleteError(result.message);
+                return; // modal tetap terbuka, pesan error tampil di dalamnya
+            }
+
+            // Hapus baris-baris terkait dari state lokal tanpa reload,
+            // reset seleksi, lalu tutup modal.
+            const deletedIds = new Set(idsToDelete);
+            setData((prev) => prev.filter((sp) => !deletedIds.has(sp.id)));
+            setSelectedIds(new Set());
+            setIsDeleting(false);
+            setIsDeleteModalOpen(false);
+        } catch (error) {
+            // Jaring pengaman untuk exception tak terduga di luar
+            // { success: false } — kelas masalah yang sama seperti yang
+            // sudah ditangani di submitStokField (lihat komentar di sana).
+            console.error("[handleConfirmDelete] unexpected error:", error);
+            setIsDeleting(false);
+            setDeleteError("Terjadi kesalahan tak terduga saat menghapus. Coba lagi.");
+        }
+    }
+
+    // --- Smart form ("+ Tambah / Restock") ---
+    //
+    // Beda dengan edit inline (yang merge hasil ke state lokal secara
+    // optimis), submit smart form bisa membuat Sparepart BARU sekaligus
+    // baris SparepartLineStock baru — supaya bentuk data yang masuk ke
+    // `data` selalu konsisten dengan shape SparepartWithRelations (include
+    // kategori/satuan/lokasiRak/lineStocks lengkap), paling aman minta
+    // Server Component (page.tsx) fetch ulang lewat router.refresh(),
+    // bukan menyusun sendiri objek barunya di client. useEffect yang
+    // mendengarkan `initialData` di atas otomatis men-sinkronkan `data`
+    // begitu props baru itu masuk.
+    function handleSmartFormSuccess() {
+        setIsSmartFormOpen(false);
+        router.refresh();
+    }
+
+    // --- Import Excel (bulk) ---
+    //
+    // Sama seperti smart form: modal Import Excel sendiri tidak tahu
+    // apa-apa soal grid, cuma panggil onSuccess setelah user menekan
+    // "Tutup" di tahap hasil (bukan langsung setelah importSparepartExcel
+    // selesai, supaya user sempat baca ringkasan sukses/gagalnya dulu).
+    // router.refresh() di sini sudah cukup untuk menampilkan SEMUA baris
+    // yang berhasil diimpor — tidak perlu menyusun sendiri baris mana
+    // yang baru/berubah di client.
+    function handleImportExcelSuccess() {
+        setIsImportExcelOpen(false);
+        router.refresh();
     }
 
     // --- Handler submit tiap jenis sel edit — dipanggil dari onSubmit
@@ -757,12 +1057,6 @@ export function SparepartGrid({
                 jumlah: delta,
                 keterangan: alasanTrimmed,
             });
-
-            // DEBUG SEMENTARA — log response mentah dari Server Action supaya
-            // kegagalan yang selama ini "diam-diam" (tidak sampai ke UI)
-            // kelihatan di browser console. Hapus console.error ini setelah
-            // root cause dikonfirmasi tuntas.
-            console.error("[submitStokField] response:", result);
 
             if (!result.success) {
                 return { status: "error", message: result.message };
@@ -843,7 +1137,7 @@ export function SparepartGrid({
                 </p>
             )}
 
-            <div className="mb-4 flex items-center gap-2">
+            <div className="mb-4 flex flex-wrap items-center gap-2">
                 <input
                     type="text"
                     value={searchQuery}
@@ -879,6 +1173,75 @@ export function SparepartGrid({
                         lokasiRakOptions={filterLokasiRakOptions}
                     />
                 </div>
+
+                {/* Urutkan — sort ULANG di client dari data yang sudah ada
+                    di memory (lihat sortedData), tidak fetch ulang ke
+                    server, jadi ganti pilihan langsung instan. */}
+                <div className="flex shrink-0 items-center gap-1.5">
+                    <label
+                        htmlFor="sparepart-sort"
+                        className="font-sans text-sm text-muted"
+                    >
+                        Urutkan:
+                    </label>
+                    <select
+                        id="sparepart-sort"
+                        value={sortBy}
+                        onChange={(event) =>
+                            setSortBy(event.target.value as SparepartSortBy)
+                        }
+                        className="rounded-md border border-ink/20 bg-surface px-2.5 py-2 font-sans text-sm text-ink focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/30"
+                    >
+                        {SORT_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                                {option.label}
+                            </option>
+                        ))}
+                    </select>
+                </div>
+
+                {/* Toolbar seleksi — hanya muncul kalau minimal 1 baris
+                    tercentang, ditaruh di baris yang sama dengan search
+                    box & tombol Filter. */}
+                {selectedIds.size > 0 && (
+                    <div className="flex shrink-0 items-center gap-2 rounded-md border border-status-danger/30 bg-status-danger/5 px-3 py-2">
+                        <span className="font-sans text-sm text-ink">
+                            {selectedIds.size} part dipilih
+                        </span>
+                        <button
+                            type="button"
+                            onClick={openDeleteModal}
+                            className="flex items-center gap-1.5 rounded-md bg-status-danger px-3 py-1.5 font-sans text-sm font-medium text-white hover:bg-status-danger/90"
+                        >
+                            <Trash2 className="h-4 w-4" />
+                            Hapus
+                        </button>
+                    </div>
+                )}
+
+                {/* "Import Excel" (outline/secondary) + "+ Tambah / Restock"
+                    (primary) — selalu paling kanan toolbar, dikelompokkan
+                    dalam 1 div ber-`ml-auto` supaya keduanya tetap menempel
+                    kanan sebagai satu grup, baik saat toolbar seleksi di
+                    atas muncul maupun tidak. */}
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                    <button
+                        type="button"
+                        onClick={() => setIsImportExcelOpen(true)}
+                        className="flex items-center gap-1.5 rounded-md border border-primary px-3 py-2 font-sans text-sm font-medium text-primary hover:bg-primary/5"
+                    >
+                        <FileSpreadsheet className="h-4 w-4" />
+                        Import Excel
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setIsSmartFormOpen(true)}
+                        className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 font-sans text-sm font-medium text-white hover:bg-primary/90"
+                    >
+                        <Plus className="h-4 w-4" />
+                        Tambah / Restock
+                    </button>
+                </div>
             </div>
 
             <div className="overflow-x-auto rounded-lg border border-ink/20">
@@ -893,6 +1256,7 @@ export function SparepartGrid({
                     style={{ minWidth: tableWidth }}
                 >
                     <colgroup>
+                        <col style={{ width: CHECKBOX_WIDTH }} />
                         <col style={{ width: ITEM_CODE_WIDTH }} />
                         <col style={{ width: PART_WIDTH }} />
                         <col style={{ width: KATEGORI_WIDTH }} />
@@ -912,17 +1276,33 @@ export function SparepartGrid({
 
                     <thead>
                         <tr>
-                            {/* Item Code: sticky, kolom pertama */}
+                            {/* Checkbox select-all: sticky, kolom paling kiri.
+                                Centang semua baris yang SEDANG TERLIHAT
+                                (sortedData), bukan semua data mentah. */}
                             <th
                                 rowSpan={3}
                                 className={`${thBase} sticky left-0 z-10 text-center`}
                             >
-                                Item Code
+                                <input
+                                    type="checkbox"
+                                    aria-label="Pilih semua part yang tampil"
+                                    checked={isAllVisibleSelected}
+                                    onChange={toggleSelectAllVisible}
+                                    className="h-4 w-4 rounded border-ink/30 accent-primary focus:outline-none focus:ring-1 focus:ring-primary/30"
+                                />
                             </th>
-                            {/* Part: sticky, kolom kedua, nempel persis di kanan Item Code */}
+                            {/* Item Code: sticky, kolom kedua (setelah checkbox) */}
                             <th
                                 rowSpan={3}
-                                style={{ left: ITEM_CODE_WIDTH }}
+                                style={{ left: ITEM_CODE_LEFT }}
+                                className={`${thBase} sticky z-10 text-center`}
+                            >
+                                Item Code
+                            </th>
+                            {/* Part: sticky, kolom ketiga, nempel persis di kanan Item Code */}
+                            <th
+                                rowSpan={3}
+                                style={{ left: PART_LEFT }}
                                 className={`${thBase} sticky z-10 text-center`}
                             >
                                 Part
@@ -970,7 +1350,7 @@ export function SparepartGrid({
                         </tr>
                     </thead>
                     <tbody>
-                        {filteredData.length === 0 ? (
+                        {sortedData.length === 0 ? (
                             <tr>
                                 <td
                                     colSpan={totalColumns}
@@ -980,7 +1360,7 @@ export function SparepartGrid({
                                 </td>
                             </tr>
                         ) : (
-                            filteredData.map((sparepart, idx) => {
+                            sortedData.map((sparepart, idx) => {
                                 const status = computeSparepartStatus(sparepart.lineStocks);
                                 // Zebra stripe: baris genap = app-bg, baris ganjil = surface.
                                 const rowBg = idx % 2 === 0 ? "bg-app-bg" : "bg-surface";
@@ -998,11 +1378,26 @@ export function SparepartGrid({
 
                                 return (
                                     <tr key={sparepart.id} className={rowBg}>
+                                        {/* Checkbox select baris: sticky, kolom paling kiri.
+                                            TIDAK bisa diedit inline — cuma toggle seleksi. */}
+                                        <td
+                                            className={`${tdBase} ${rowBg} sticky left-0 ${stickyZIndex} text-center`}
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                aria-label={`Pilih ${sparepart.namaPart}`}
+                                                checked={selectedIds.has(sparepart.id)}
+                                                onChange={() => toggleSelectOne(sparepart.id)}
+                                                className="h-4 w-4 rounded border-ink/30 accent-primary focus:outline-none focus:ring-1 focus:ring-primary/30"
+                                            />
+                                        </td>
+
                                         {/* Item Code: sticky + font-mono + bg eksplisit
                                             supaya tidak transparan saat scroll horizontal.
                                             TIDAK bisa diedit inline (di luar scope). */}
                                         <td
-                                            className={`${tdBase} ${rowBg} sticky left-0 ${stickyZIndex} overflow-hidden text-center font-mono`}
+                                            style={{ left: ITEM_CODE_LEFT }}
+                                            className={`${tdBase} ${rowBg} sticky ${stickyZIndex} overflow-hidden text-center font-mono`}
                                         >
                                             <span className="block truncate">{sparepart.itemCode}</span>
                                         </td>
@@ -1010,7 +1405,7 @@ export function SparepartGrid({
                                         {/* Part (namaPart): sticky, BISA diedit inline.
                                             td punya `relative` sebagai anchor floating panel. */}
                                         <td
-                                            style={{ left: ITEM_CODE_WIDTH }}
+                                            style={{ left: PART_LEFT }}
                                             className={`${tdBase} ${rowBg} relative sticky ${stickyZIndex} text-center`}
                                         >
                                             {editingCellId === namaPartCellId ? (
@@ -1213,9 +1608,23 @@ export function SparepartGrid({
                                             );
                                         })}
 
-                                        {/* Status: TIDAK bisa diedit inline (dihitung otomatis). */}
-                                        <td className={`${tdBase} text-center`}>
-                                            <StatusBadge status={status} />
+                                        {/* Status: TIDAK bisa diedit inline (dihitung otomatis).
+                                            `style` menambah padding horizontal sedikit di atas
+                                            px-3 bawaan tdBase (override lewat inline style supaya
+                                            pasti menang, tidak gantung pada urutan utility class
+                                            Tailwind) — murni kosmetik untuk kolom ini, TIDAK
+                                            mengubah lebar kolom (masih dikontrol STATUS_WIDTH di
+                                            colgroup), jadi kolom Keterangan di sebelah kanan tidak
+                                            ikut bergeser/ketutup. Span pembungkus `whitespace-nowrap`
+                                            memastikan teks status panjang (mis. "Restock L1, L2, L3")
+                                            tidak pecah ke baris baru di dalam badge. */}
+                                        <td
+                                            className={`${tdBase} overflow-hidden text-center`}
+                                            style={{ paddingLeft: "1rem", paddingRight: "1rem" }}
+                                        >
+                                            <span className="inline-block whitespace-nowrap">
+                                                <StatusBadge status={status} />
+                                            </span>
                                         </td>
 
                                         {/* Keterangan: BISA diedit inline. */}
@@ -1248,6 +1657,30 @@ export function SparepartGrid({
                     </tbody>
                 </table>
             </div>
+
+            {isDeleteModalOpen && (
+                <DeleteConfirmModal
+                    count={selectedIds.size}
+                    isDeleting={isDeleting}
+                    error={deleteError}
+                    onCancel={closeDeleteModal}
+                    onConfirm={handleConfirmDelete}
+                />
+            )}
+
+            {isSmartFormOpen && (
+                <SmartFormModal
+                    onClose={() => setIsSmartFormOpen(false)}
+                    onSuccess={handleSmartFormSuccess}
+                />
+            )}
+
+            {isImportExcelOpen && (
+                <ImportExcelModal
+                    onClose={() => setIsImportExcelOpen(false)}
+                    onSuccess={handleImportExcelSuccess}
+                />
+            )}
         </div>
     );
 }

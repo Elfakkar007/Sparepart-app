@@ -10,7 +10,7 @@ export const authConfig = {
             const isOnLogin = nextUrl.pathname.startsWith("/login");
 
             if (isOnLogin) {
-                if (isLoggedIn) return Response.redirect(new URL("/", nextUrl));
+                if (isLoggedIn) return Response.redirect(new URL("/sparepart", nextUrl));
                 return true;
             }
 

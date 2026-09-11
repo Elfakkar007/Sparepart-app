@@ -52,6 +52,55 @@ export async function addKategori(
     }
 }
 
+export async function updateKategori(
+    id: string,
+    namaBaru: string
+): Promise<ActionResult<Kategori>> {
+    const namaValid = normalizeNama(namaBaru);
+    if (!namaValid) {
+        return { success: false, message: "Nama tidak boleh kosong" };
+    }
+
+    try {
+        const data = await prisma.kategori.update({
+            where: { id },
+            data: { nama: namaValid },
+        });
+        return { success: true, data };
+    } catch (error) {
+        return toFriendlyError(
+            error,
+            "Gagal memperbarui kategori",
+            NAMA_SUDAH_TERDAFTAR
+        );
+    }
+}
+
+export async function deleteKategori(
+    id: string
+): Promise<ActionResult<{ deletedId: string }>> {
+    try {
+        // Cek dulu apakah kategori ini masih dipakai Sparepart lain
+        // sebelum dihapus — pola sama seperti cleanupIfUnused() di
+        // cleanup-test-data.ts.
+        const usageCount = await prisma.sparepart.count({
+            where: { kategoriId: id },
+        });
+
+        if (usageCount > 0) {
+            return {
+                success: false,
+                message: `Masih dipakai oleh ${usageCount} part, tidak bisa dihapus`,
+            };
+        }
+
+        await prisma.kategori.delete({ where: { id } });
+        return { success: true, data: { deletedId: id } };
+    } catch (error) {
+        return toFriendlyError(error, "Gagal menghapus kategori");
+    }
+}
+
 // ==========================================================
 // LOKASI RAK
 // ==========================================================
@@ -93,6 +142,54 @@ export async function addLokasiRak(
     }
 }
 
+export async function updateLokasiRak(
+    id: string,
+    namaBaru: string
+): Promise<ActionResult<LokasiRak>> {
+    const namaValid = normalizeNama(namaBaru);
+    if (!namaValid) {
+        return { success: false, message: "Nama tidak boleh kosong" };
+    }
+
+    try {
+        const data = await prisma.lokasiRak.update({
+            where: { id },
+            data: { nama: namaValid },
+        });
+        return { success: true, data };
+    } catch (error) {
+        return toFriendlyError(
+            error,
+            "Gagal memperbarui lokasi rak",
+            NAMA_SUDAH_TERDAFTAR
+        );
+    }
+}
+
+export async function deleteLokasiRak(
+    id: string
+): Promise<ActionResult<{ deletedId: string }>> {
+    try {
+        // lokasiRakId opsional di Sparepart, tapi pengecekan usage-nya
+        // tetap sama: hitung Sparepart yang field ini-nya = id target.
+        const usageCount = await prisma.sparepart.count({
+            where: { lokasiRakId: id },
+        });
+
+        if (usageCount > 0) {
+            return {
+                success: false,
+                message: `Masih dipakai oleh ${usageCount} part, tidak bisa dihapus`,
+            };
+        }
+
+        await prisma.lokasiRak.delete({ where: { id } });
+        return { success: true, data: { deletedId: id } };
+    } catch (error) {
+        return toFriendlyError(error, "Gagal menghapus lokasi rak");
+    }
+}
+
 // ==========================================================
 // SATUAN
 // ==========================================================
@@ -131,5 +228,51 @@ export async function addSatuan(
             "Gagal menambahkan satuan",
             NAMA_SUDAH_TERDAFTAR
         );
+    }
+}
+
+export async function updateSatuan(
+    id: string,
+    namaBaru: string
+): Promise<ActionResult<Satuan>> {
+    const namaValid = normalizeNama(namaBaru);
+    if (!namaValid) {
+        return { success: false, message: "Nama tidak boleh kosong" };
+    }
+
+    try {
+        const data = await prisma.satuan.update({
+            where: { id },
+            data: { nama: namaValid },
+        });
+        return { success: true, data };
+    } catch (error) {
+        return toFriendlyError(
+            error,
+            "Gagal memperbarui satuan",
+            NAMA_SUDAH_TERDAFTAR
+        );
+    }
+}
+
+export async function deleteSatuan(
+    id: string
+): Promise<ActionResult<{ deletedId: string }>> {
+    try {
+        const usageCount = await prisma.sparepart.count({
+            where: { satuanId: id },
+        });
+
+        if (usageCount > 0) {
+            return {
+                success: false,
+                message: `Masih dipakai oleh ${usageCount} part, tidak bisa dihapus`,
+            };
+        }
+
+        await prisma.satuan.delete({ where: { id } });
+        return { success: true, data: { deletedId: id } };
+    } catch (error) {
+        return toFriendlyError(error, "Gagal menghapus satuan");
     }
 }

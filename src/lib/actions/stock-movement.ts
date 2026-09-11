@@ -4,7 +4,11 @@ import { prisma } from "@/lib/prisma";
 import type { Line, SparepartLineStock } from "@/generated/prisma/client";
 import { auth } from "@/auth";
 import { isUniqueConstraintError, toFriendlyError, normalizeText } from "./_shared";
-import type { ActionResult } from "./_shared";
+import type { ActionResult, TxClient } from "./_shared";
+// Class error di-import dari stock-errors.ts (file BUKAN "use server"),
+// bukan didefinisikan di sini — file "use server" cuma boleh export
+// async function, lihat komentar lengkap di stock-errors.ts.
+import { InsufficientStockError, LineStockRaceError } from "./stock-errors";
 
 // ==========================================================
 // RECORD STOCK MOVEMENT
@@ -43,16 +47,107 @@ export type RecordStockMovementResult = {
     lineStock: SparepartLineStock;
 };
 
+export type RecordStockMovementCoreInput = {
+    sparepartId: string;
+    line: Line;
+    tipe: "MASUK" | "KOREKSI";
+    /** Delta FINAL (tanda sudah benar, MASUK selalu positif) — bukan raw
+     *  input dari user. Validasi "jumlah > 0 utk MASUK" dan "keterangan
+     *  wajib utk KOREKSI" jadi tanggung jawab pemanggil, SEBELUM membuka
+     *  transaction (lihat recordStockMovement di bawah). */
+    jumlah: number;
+    referensi?: string;
+    /** Sudah dinormalisasi/divalidasi oleh caller. */
+    keterangan?: string;
+};
+
 /**
- * Sentinel error untuk memicu rollback prisma.$transaction ketika stok
- * akan jadi minus. Dilempar DI DALAM transaction, ditangkap lagi di
- * catch luar untuk dikonversi jadi ActionResult yang ramah.
+ * Core logic pencatatan stock movement, dijalankan DI DALAM transaction
+ * yang di-pass oleh caller (`tx`). Dipakai baik oleh recordStockMovement
+ * (yang buka transaction sendiri) maupun submitSmartForm di sparepart.ts
+ * (yang menggabungkan pembuatan Sparepart baru + beberapa pergerakan
+ * stok dalam SATU transaction).
  */
-class InsufficientStockError extends Error {
-    constructor() {
-        super("Stok tidak boleh minus");
-        this.name = "InsufficientStockError";
+export async function recordStockMovementCore(
+    tx: TxClient,
+    userId: string,
+    input: RecordStockMovementCoreInput
+): Promise<RecordStockMovementResult> {
+    const { sparepartId, line, tipe, jumlah: delta, referensi, keterangan } = input;
+
+    // Cari baris SparepartLineStock untuk (sparepartId, line).
+    // Kalau belum ada, buat baru dengan jumlah & minStok = 0.
+    let lineStock = await tx.sparepartLineStock.findUnique({
+        where: { sparepartId_line: { sparepartId, line } },
+    });
+
+    if (!lineStock) {
+        try {
+            lineStock = await tx.sparepartLineStock.create({
+                data: { sparepartId, line, jumlah: 0, minStok: 0 },
+            });
+        } catch (error) {
+            if (isUniqueConstraintError(error)) {
+                throw new LineStockRaceError();
+            }
+            throw error;
+        }
     }
+
+    // Hitung jumlah baru, pastikan tidak minus.
+    const newJumlahLine = lineStock.jumlah + delta;
+    if (newJumlahLine < 0) {
+        // Melempar error di sini membatalkan SELURUH transaction ini,
+        // termasuk create baris baru di atas kalau memang baru dibuat.
+        throw new InsufficientStockError();
+    }
+
+    // Update baris line stock. lastOpnameDate hanya disentuh kalau
+    // ini koreksi (dianggap sebagai kegiatan stok opname).
+    const updatedLineStock = await tx.sparepartLineStock.update({
+        where: { id: lineStock.id },
+        data: {
+            jumlah: newJumlahLine,
+            ...(tipe === "KOREKSI" ? { lastOpnameDate: new Date() } : {}),
+        },
+    });
+
+    // Hitung ulang total stok Sparepart dari SEMUA baris line miliknya
+    // (bukan cuma nambah/kurang delta ke Sparepart.stok), supaya tetap
+    // konsisten walau ada baris line lain yang sempat out-of-sync.
+    // Aggregate ini jalan dalam transaction yang sama sehingga sudah
+    // melihat hasil update baris di atas.
+    const aggregate = await tx.sparepartLineStock.aggregate({
+        where: { sparepartId },
+        _sum: { jumlah: true },
+    });
+    const newTotalStok = aggregate._sum.jumlah ?? 0;
+
+    await tx.sparepart.update({
+        where: { id: sparepartId },
+        data: { stok: newTotalStok },
+    });
+
+    // Catat pergerakan stok. `jumlah` yang disimpan = delta (bisa
+    // negatif untuk koreksi turun), BUKAN jumlah akhir setelah update.
+    await tx.stockMovement.create({
+        data: {
+            sparepartId,
+            line,
+            tipe,
+            sumber: tipe === "MASUK" ? "ADMIN_MASUK" : "ADMIN_KOREKSI",
+            jumlah: delta,
+            referensi: referensi?.trim() || undefined,
+            keterangan: keterangan ?? undefined,
+            userId,
+        },
+    });
+
+    return {
+        newJumlahLine: updatedLineStock.jumlah,
+        newTotalStok,
+        lineStock: updatedLineStock,
+    };
 }
 
 export async function recordStockMovement(
@@ -64,98 +159,38 @@ export async function recordStockMovement(
     }
     const userId = session.user.id;
 
-    const { sparepartId, line, tipe, jumlah, referensi } = input;
-
     // --- Validasi yang tidak butuh akses database, dicek DI LUAR
     //     transaction supaya input yang sudah pasti gagal tidak sampai
     //     membuka koneksi transaksi. ---
 
     const keteranganValid = normalizeText(input.keterangan ?? "");
-    if (tipe === "KOREKSI" && !keteranganValid) {
+    if (input.tipe === "KOREKSI" && !keteranganValid) {
         return {
             success: false,
             message: "Keterangan wajib diisi untuk koreksi stok",
         };
     }
 
-    if (tipe === "MASUK" && jumlah <= 0) {
+    if (input.tipe === "MASUK" && input.jumlah <= 0) {
         return { success: false, message: "Jumlah restock harus lebih dari 0" };
     }
 
     // Untuk MASUK delta selalu positif (sudah divalidasi jumlah > 0 di atas,
     // Math.abs() cuma jaga-jaga). Untuk KOREKSI delta dipakai apa adanya
     // (boleh negatif).
-    const delta = tipe === "MASUK" ? Math.abs(jumlah) : jumlah;
+    const delta = input.tipe === "MASUK" ? Math.abs(input.jumlah) : input.jumlah;
 
     try {
-        const result = await prisma.$transaction(async (tx) => {
-            // Cari baris SparepartLineStock untuk (sparepartId, line).
-            // Kalau belum ada, buat baru dengan jumlah & minStok = 0.
-            let lineStock = await tx.sparepartLineStock.findUnique({
-                where: { sparepartId_line: { sparepartId, line } },
-            });
-
-            if (!lineStock) {
-                lineStock = await tx.sparepartLineStock.create({
-                    data: { sparepartId, line, jumlah: 0, minStok: 0 },
-                });
-            }
-
-            // Hitung jumlah baru, pastikan tidak minus.
-            const newJumlahLine = lineStock.jumlah + delta;
-            if (newJumlahLine < 0) {
-                // Melempar error di sini membatalkan SELURUH transaction ini,
-                // termasuk create baris baru di atas kalau memang baru dibuat.
-                throw new InsufficientStockError();
-            }
-
-            // Update baris line stock. lastOpnameDate hanya disentuh kalau
-            // ini koreksi (dianggap sebagai kegiatan stok opname).
-            const updatedLineStock = await tx.sparepartLineStock.update({
-                where: { id: lineStock.id },
-                data: {
-                    jumlah: newJumlahLine,
-                    ...(tipe === "KOREKSI" ? { lastOpnameDate: new Date() } : {}),
-                },
-            });
-
-            // Hitung ulang total stok Sparepart dari SEMUA baris line miliknya
-            // (bukan cuma nambah/kurang delta ke Sparepart.stok), supaya tetap
-            // konsisten walau ada baris line lain yang sempat out-of-sync.
-            // Aggregate ini jalan dalam transaction yang sama sehingga sudah
-            // melihat hasil update baris di atas.
-            const aggregate = await tx.sparepartLineStock.aggregate({
-                where: { sparepartId },
-                _sum: { jumlah: true },
-            });
-            const newTotalStok = aggregate._sum.jumlah ?? 0;
-
-            await tx.sparepart.update({
-                where: { id: sparepartId },
-                data: { stok: newTotalStok },
-            });
-
-            // Catat pergerakan stok. `jumlah` yang disimpan = delta (bisa
-            // negatif untuk koreksi turun), BUKAN jumlah akhir setelah update.
-            await tx.stockMovement.create({
-                data: {
-                    sparepartId,
-                    line,
-                    tipe,
-                    sumber: tipe === "MASUK" ? "ADMIN_MASUK" : "ADMIN_KOREKSI",
-                    jumlah: delta,
-                    referensi: referensi?.trim() || undefined,
-                    keterangan: keteranganValid ?? undefined,
-                    userId,
-                },
-            });
-
-            return {
-                newJumlahLine: updatedLineStock.jumlah,
-                newTotalStok,
-                lineStock: updatedLineStock,
-            };
-        });
+        const result = await prisma.$transaction((tx) =>
+            recordStockMovementCore(tx, userId, {
+                sparepartId: input.sparepartId,
+                line: input.line,
+                tipe: input.tipe,
+                jumlah: delta,
+                referensi: input.referensi,
+                keterangan: keteranganValid ?? undefined,
+            })
+        );
 
         return { success: true, data: result };
     } catch (error) {
@@ -164,15 +199,10 @@ export async function recordStockMovement(
         }
 
         // Race condition: dua request nyaris bersamaan sama-sama tidak
-        // menemukan baris (findUnique kosong) lalu sama-sama coba create
-        // baris SparepartLineStock untuk (sparepartId, line) yang sama —
-        // salah satunya kena unique constraint @@unique([sparepartId, line]).
-        if (isUniqueConstraintError(error)) {
-            return {
-                success: false,
-                message:
-                    "Data stok line ini sedang diproses permintaan lain, silakan coba lagi",
-            };
+        // menemukan baris lalu sama-sama coba create baris
+        // SparepartLineStock untuk (sparepartId, line) yang sama.
+        if (error instanceof LineStockRaceError) {
+            return { success: false, message: error.message };
         }
 
         return toFriendlyError(error, "Gagal mencatat pergerakan stok");
@@ -196,6 +226,30 @@ export type UpdateLineMinStokResult = {
     lineStock: SparepartLineStock;
 };
 
+/**
+ * Core logic update minStok, menerima `tx` supaya bisa jadi bagian dari
+ * transaction yang lebih besar (dipakai submitSmartForm di sparepart.ts).
+ */
+export async function updateLineMinStokCore(
+    tx: TxClient,
+    sparepartId: string,
+    line: Line,
+    minStok: number
+): Promise<UpdateLineMinStokResult> {
+    const lineStock = await tx.sparepartLineStock.upsert({
+        where: { sparepartId_line: { sparepartId, line } },
+        update: { minStok },
+        create: { sparepartId, line, minStok, jumlah: 0 },
+    });
+
+    return {
+        sparepartId: lineStock.sparepartId,
+        line: lineStock.line,
+        minStok: lineStock.minStok,
+        lineStock,
+    };
+}
+
 export async function updateLineMinStok(
     sparepartId: string,
     line: Line,
@@ -211,21 +265,8 @@ export async function updateLineMinStok(
     }
 
     try {
-        const lineStock = await prisma.sparepartLineStock.upsert({
-            where: { sparepartId_line: { sparepartId, line } },
-            update: { minStok },
-            create: { sparepartId, line, minStok, jumlah: 0 },
-        });
-
-        return {
-            success: true,
-            data: {
-                sparepartId: lineStock.sparepartId,
-                line: lineStock.line,
-                minStok: lineStock.minStok,
-                lineStock,
-            },
-        };
+        const data = await updateLineMinStokCore(prisma, sparepartId, line, minStok);
+        return { success: true, data };
     } catch (error) {
         return toFriendlyError(error, "Gagal memperbarui minimal stok");
     }

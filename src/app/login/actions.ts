@@ -40,5 +40,5 @@ export async function loginAction(
     }
 
     // Kalau tidak ada error yang dilempar, berarti login berhasil.
-    redirect("/");
+    redirect("/sparepart");
 }
