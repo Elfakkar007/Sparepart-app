@@ -1,75 +1,34 @@
-import type { Line } from "@/generated/prisma/client";
-
-// Urutan tampilan/pengurutan line saat status "Restock ..." dirangkai,
-// SENGAJA tidak mengandalkan urutan array `lineStocks` dari database.
-const LINE_ORDER: Line[] = ["LINE_1", "LINE_2", "LINE_3", "LINE_4", "GENERAL"];
-
-// Label singkat per line untuk pesan "Restock ...".
-const LINE_LABEL: Record<Line, string> = {
-    LINE_1: "L1",
-    LINE_2: "L2",
-    LINE_3: "L3",
-    LINE_4: "L4",
-    GENERAL: "General",
-};
+/**
+ * Tipe status stok untuk satu line:
+ * - "Cukup"   : jika stok di atas atau sama dengan minimum (jumlah >= minStok)
+ * - "Restock" : jika stok kurang dari minimum (jumlah < minStok)
+ */
+export type LineStatus = "Cukup" | "Restock";
 
 /**
- * Hitung status stok sebuah sparepart dari baris stok per line-nya.
- * Fungsi murni: tidak akses database, tidak ada side effect.
- *
- * Contoh:
- *
- *   computeSparepartStatus([])
- *   → "Belum Ada Stok"
- *
- *   computeSparepartStatus([
- *       { line: "LINE_1", jumlah: 10, minStok: 5 },
- *       { line: "LINE_2", jumlah: 8, minStok: 3 },
- *   ])
- *   → "Cukup"
- *
- *   computeSparepartStatus([
- *       { line: "LINE_1", jumlah: 2, minStok: 5 },
- *       { line: "LINE_2", jumlah: 1, minStok: 3 },
- *   ])
- *   → "Restock Total"   (semua baris kurang)
- *
- *   computeSparepartStatus([
- *       { line: "LINE_1", jumlah: 10, minStok: 5 },
- *       { line: "LINE_2", jumlah: 1, minStok: 3 },
- *       { line: "LINE_3", jumlah: 0, minStok: 2 },
- *   ])
- *   → "Restock L2, L3"   (sebagian kurang, urut sesuai LINE_ORDER)
- *
- *   computeSparepartStatus([
- *       { line: "LINE_1", jumlah: 10, minStok: 5 },
- *       { line: "GENERAL", jumlah: 0, minStok: 5 },
- *   ])
- *   → "Restock General"
+ * Hitung status stok per line:
+ * jika stok di atas atau sama dengan minimum maka "Cukup", jika kurang maka "Restock".
+ */
+export function computeLineStatus(
+    jumlah: number,
+    minStok: number
+): LineStatus {
+    return jumlah >= minStok ? "Cukup" : "Restock";
+}
+
+/**
+ * Hitung status agregat stok sparepart (dipakai untuk filter status di grid):
+ * - "Belum Ada Stok" : belum ada data line stock
+ * - "Restock"        : jika ada minimal 1 line yang stoknya kurang dari minStok
+ * - "Cukup"          : jika semua line stoknya mencukupi
  */
 export function computeSparepartStatus(
-    lineStocks: { line: Line; jumlah: number; minStok: number }[]
+    lineStocks: { jumlah: number; minStok: number }[]
 ): string {
     if (lineStocks.length === 0) {
         return "Belum Ada Stok";
     }
 
-    const kurang = lineStocks.filter((ls) => ls.jumlah < ls.minStok);
-
-    if (kurang.length === 0) {
-        return "Cukup";
-    }
-
-    if (kurang.length === lineStocks.length) {
-        return "Restock Total";
-    }
-
-    // Sebagian kurang: petakan ke label singkat, urutkan sesuai LINE_ORDER
-    // (bukan urutan asal `lineStocks`), lalu gabung dengan koma.
-    const kurangLines = new Set(kurang.map((ls) => ls.line));
-    const labels = LINE_ORDER.filter((line) => kurangLines.has(line)).map(
-        (line) => LINE_LABEL[line]
-    );
-
-    return `Restock ${labels.join(", ")}`;
+    const hasKurang = lineStocks.some((ls) => ls.jumlah < ls.minStok);
+    return hasKurang ? "Restock" : "Cukup";
 }

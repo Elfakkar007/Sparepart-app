@@ -1,7 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { Check, Loader2, X } from "lucide-react";
+import {
+    useEffect,
+    useRef,
+    useState,
+    type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
+import { Check, ChevronDown, Loader2, X } from "lucide-react";
 import {
     getSparepartByItemCode,
     submitSmartForm,
@@ -9,10 +14,9 @@ import {
 } from "@/lib/actions/sparepart";
 import {
     getKategoriList,
-    getLokasiRakList,
     getSatuanList,
 } from "@/lib/actions/master-data";
-import type { Kategori, Line, LokasiRak, Satuan } from "@/generated/prisma/client";
+import type { Kategori, Line, Satuan } from "@/generated/prisma/client";
 import { LINES } from "./line-config";
 
 // ==========================================================
@@ -55,17 +59,201 @@ function inputClass(locked: boolean): string {
         }`;
 }
 
+// ==========================================================
+// SEARCHABLE SELECT — pengganti <select> native untuk field master
+// (Kategori/Satuan) yang bisa punya banyak sekali opsi. <select> native
+// memaksa user men-scroll daftar panjang untuk cari satu nama; combobox
+// ini menyembunyikan opsi di balik dropdown yang bisa disaring lewat
+// pencarian, jadi tetap praktis dipakai berapa pun jumlah opsinya.
+//
+// Pola & styling SENGAJA disamakan dengan MultiSelectCombobox di
+// filter-popup.tsx (trigger + panel absolute, klik-luar untuk menutup,
+// auto-fokus kotak cari tiap dibuka) — bedanya combobox ini SINGLE-SELECT
+// (pilih 1 value, trigger menampilkan label terpilih langsung, bukan chip).
+//
+// Generic <T extends { id: string; nama: string }> supaya bisa langsung
+// menerima Kategori[]/Satuan[] dari Prisma tanpa perlu map/transformasi
+// di pemanggilnya.
+// ==========================================================
+function SearchableSelect<T extends { id: string; nama: string }>({
+    options,
+    value,
+    onChange,
+    placeholder,
+    disabled = false,
+    loading = false,
+}: {
+    options: T[];
+    value: string;
+    onChange: (id: string) => void;
+    placeholder: string;
+    disabled?: boolean;
+    loading?: boolean;
+}) {
+    const [isOpen, setIsOpen] = useState(false);
+    const [query, setQuery] = useState("");
+    const wrapperRef = useRef<HTMLDivElement>(null);
+    const searchInputRef = useRef<HTMLInputElement>(null);
+
+    const isDisabled = disabled || loading;
+    const selectedOption = options.find((option) => option.id === value) ?? null;
+
+    // Tutup dropdown kalau user klik di luar wrapper — sama seperti
+    // MultiSelectCombobox, pakai "mousedown" supaya kelar sebelum click
+    // lain (mis. klik trigger combobox lain di sebelahnya) diproses.
+    useEffect(() => {
+        if (!isOpen) return;
+        function handlePointerDown(event: MouseEvent) {
+            if (
+                wrapperRef.current &&
+                !wrapperRef.current.contains(event.target as Node)
+            ) {
+                setIsOpen(false);
+            }
+        }
+        document.addEventListener("mousedown", handlePointerDown);
+        return () => document.removeEventListener("mousedown", handlePointerDown);
+    }, [isOpen]);
+
+    // Reset kotak pencarian & auto-fokus input tiap dropdown dibuka.
+    useEffect(() => {
+        if (isOpen) {
+            setQuery("");
+            requestAnimationFrame(() => searchInputRef.current?.focus());
+        }
+    }, [isOpen]);
+
+    // Kalau combobox berubah jadi disabled/loading saat sedang terbuka
+    // (mis. isSaving berubah true tepat saat dropdown terbuka), paksa
+    // tertutup supaya tidak ada dropdown "mengambang" di atas field yang
+    // sudah terkunci.
+    useEffect(() => {
+        if (isDisabled) setIsOpen(false);
+    }, [isDisabled]);
+
+    function handleToggleOpen() {
+        if (isDisabled) return;
+        setIsOpen((prev) => !prev);
+    }
+
+    // Trigger BUKAN elemen <button> asli (sama alasannya dengan
+    // MultiSelectCombobox) supaya aman dipakai di dalam struktur apapun
+    // tanpa risiko nested-button; Enter/Space ditangani manual di sini.
+    function handleTriggerKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+        if (isDisabled) return;
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            handleToggleOpen();
+        }
+    }
+
+    function handleSelect(id: string) {
+        onChange(id);
+        setIsOpen(false);
+    }
+
+    const filteredOptions = query.trim()
+        ? options.filter((option) =>
+            option.nama.toLowerCase().includes(query.trim().toLowerCase())
+        )
+        : options;
+
+    return (
+        <div ref={wrapperRef} className="relative">
+            <div
+                role="button"
+                tabIndex={isDisabled ? -1 : 0}
+                onClick={handleToggleOpen}
+                onKeyDown={handleTriggerKeyDown}
+                aria-expanded={isOpen}
+                aria-haspopup="listbox"
+                aria-disabled={isDisabled}
+                className={`flex items-center justify-between gap-2 rounded border px-3 py-2 font-sans text-sm outline-none transition-colors focus-visible:ring-1 focus-visible:ring-primary/30 ${isDisabled
+                    ? "cursor-not-allowed border-ink/10 bg-ink/5 text-muted"
+                    : "cursor-pointer border-ink/20 bg-app-bg text-ink hover:border-ink/30"
+                    } ${isOpen ? "border-primary ring-1 ring-primary/30" : ""}`}
+            >
+                <span className={`truncate ${selectedOption ? "" : "text-muted"}`}>
+                    {loading
+                        ? "Memuat..."
+                        : selectedOption
+                            ? selectedOption.nama
+                            : placeholder}
+                </span>
+                <ChevronDown
+                    className={`h-4 w-4 shrink-0 text-muted transition-transform duration-150 ${isOpen ? "rotate-180" : ""
+                        }`}
+                />
+            </div>
+
+            {isOpen && !isDisabled && (
+                <div
+                    role="listbox"
+                    // z-20 cukup: dropdown ini hanya perlu menang dari elemen
+                    // normal-flow di bawahnya (Keterangan, Stok per Line) yang
+                    // sama sekali tidak di-posisikan — lihat catatan z-index di
+                    // MultiSelectCombobox untuk kasus yang lebih rumit (footer
+                    // sticky), yang tidak berlaku di modal ini.
+                    className="absolute left-0 top-full z-20 mt-1 w-full overflow-hidden rounded-md border border-ink/20 bg-surface shadow-lg"
+                    onClick={(event) => event.stopPropagation()}
+                >
+                    <div className="border-b border-ink/10 p-1.5">
+                        <input
+                            ref={searchInputRef}
+                            type="text"
+                            value={query}
+                            onChange={(event) => setQuery(event.target.value)}
+                            placeholder="Cari..."
+                            className="w-full rounded border border-ink/15 px-2 py-1 font-sans text-sm text-ink outline-none focus:border-primary"
+                        />
+                    </div>
+                    <div className="max-h-48 overflow-y-auto p-1">
+                        {filteredOptions.length === 0 ? (
+                            <p className="px-2 py-1.5 font-sans text-xs text-muted">
+                                Tidak ada hasil
+                            </p>
+                        ) : (
+                            filteredOptions.map((option) => {
+                                const isSelected = option.id === value;
+                                return (
+                                    <button
+                                        key={option.id}
+                                        type="button"
+                                        role="option"
+                                        aria-selected={isSelected}
+                                        onClick={() => handleSelect(option.id)}
+                                        className="flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left font-sans text-sm text-ink hover:bg-app-bg"
+                                    >
+                                        <span className="truncate">{option.nama}</span>
+                                        {isSelected && (
+                                            <Check className="h-4 w-4 shrink-0 text-primary" />
+                                        )}
+                                    </button>
+                                );
+                            })
+                        )}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
 export function SmartFormModal({ onClose, onSuccess }: SmartFormModalProps) {
     // ==========================================================
-    // Data master (Kategori/Satuan/LokasiRak) — sengaja di-fetch SENDIRI
-    // di sini lewat useEffect saat modal mount, BUKAN diterima sebagai
-    // props dari SparepartGrid, supaya selalu dapat data terbaru
-    // (mis. kategori baru yang ditambahkan user lewat modal lain sesaat
+    // Data master (Kategori/Satuan) — sengaja di-fetch SENDIRI di sini
+    // lewat useEffect saat modal mount, BUKAN diterima sebagai props
+    // dari SparepartGrid, supaya selalu dapat data terbaru (mis.
+    // kategori baru yang ditambahkan user lewat modal lain sesaat
     // sebelum modal ini dibuka).
+    //
+    // CATATAN: field Lokasi Rak sengaja TIDAK ditampilkan/di-fetch lagi
+    // di form ini (field lokasiRakId di Sparepart & tabel LokasiRak
+    // tetap ada di database, hanya disembunyikan dari UI karena rencana
+    // pemakaiannya berubah jadi per-line, bukan per-part).
     // ==========================================================
     const [kategoriOptions, setKategoriOptions] = useState<Kategori[]>([]);
     const [satuanOptions, setSatuanOptions] = useState<Satuan[]>([]);
-    const [lokasiRakOptions, setLokasiRakOptions] = useState<LokasiRak[]>([]);
     const [isMasterDataLoading, setIsMasterDataLoading] = useState(true);
     const [masterDataError, setMasterDataError] = useState<string | null>(null);
 
@@ -76,10 +264,9 @@ export function SmartFormModal({ onClose, onSuccess }: SmartFormModalProps) {
             setIsMasterDataLoading(true);
             setMasterDataError(null);
             try {
-                const [kategoriResult, satuanResult, lokasiRakResult] = await Promise.all([
+                const [kategoriResult, satuanResult] = await Promise.all([
                     getKategoriList(),
                     getSatuanList(),
-                    getLokasiRakList(),
                 ]);
                 if (cancelled) return;
 
@@ -91,14 +278,9 @@ export function SmartFormModal({ onClose, onSuccess }: SmartFormModalProps) {
                     setMasterDataError(satuanResult.message);
                     return;
                 }
-                if (!lokasiRakResult.success) {
-                    setMasterDataError(lokasiRakResult.message);
-                    return;
-                }
 
                 setKategoriOptions(kategoriResult.data);
                 setSatuanOptions(satuanResult.data);
-                setLokasiRakOptions(lokasiRakResult.data);
             } catch (error) {
                 if (!cancelled) {
                     console.error(
@@ -240,7 +422,6 @@ export function SmartFormModal({ onClose, onSuccess }: SmartFormModalProps) {
     const [spesifikasi, setSpesifikasi] = useState("");
     const [kategoriId, setKategoriId] = useState("");
     const [satuanId, setSatuanId] = useState("");
-    const [lokasiRakId, setLokasiRakId] = useState("");
     const [keterangan, setKeterangan] = useState("");
 
     // Reset isian field master tiap kali form "masuk" ke mode PART_BARU
@@ -253,7 +434,6 @@ export function SmartFormModal({ onClose, onSuccess }: SmartFormModalProps) {
         setSpesifikasi("");
         setKategoriId("");
         setSatuanId("");
-        setLokasiRakId("");
         setKeterangan("");
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [partBaruKey]);
@@ -356,7 +536,6 @@ export function SmartFormModal({ onClose, onSuccess }: SmartFormModalProps) {
                     keterangan: keterangan.trim() || undefined,
                     kategoriId,
                     satuanId,
-                    lokasiRakId: lokasiRakId || undefined,
                     lineStocks: lineStocksResult.lineStocks,
                 }
                 : {
@@ -545,23 +724,14 @@ export function SmartFormModal({ onClose, onSuccess }: SmartFormModalProps) {
                                             className={inputClass(true)}
                                         />
                                     ) : (
-                                        <select
+                                        <SearchableSelect
+                                            options={kategoriOptions}
                                             value={kategoriId}
-                                            onChange={(e) => setKategoriId(e.target.value)}
-                                            disabled={isSaving || isMasterDataLoading}
-                                            className={inputClass(false)}
-                                        >
-                                            <option value="">
-                                                {isMasterDataLoading
-                                                    ? "Memuat..."
-                                                    : "— Pilih Kategori —"}
-                                            </option>
-                                            {kategoriOptions.map((k) => (
-                                                <option key={k.id} value={k.id}>
-                                                    {k.nama}
-                                                </option>
-                                            ))}
-                                        </select>
+                                            onChange={setKategoriId}
+                                            placeholder="— Pilih Kategori —"
+                                            disabled={isSaving}
+                                            loading={isMasterDataLoading}
+                                        />
                                     )}
                                 </div>
                                 <div>
@@ -579,54 +749,16 @@ export function SmartFormModal({ onClose, onSuccess }: SmartFormModalProps) {
                                             className={inputClass(true)}
                                         />
                                     ) : (
-                                        <select
+                                        <SearchableSelect
+                                            options={satuanOptions}
                                             value={satuanId}
-                                            onChange={(e) => setSatuanId(e.target.value)}
-                                            disabled={isSaving || isMasterDataLoading}
-                                            className={inputClass(false)}
-                                        >
-                                            <option value="">
-                                                {isMasterDataLoading
-                                                    ? "Memuat..."
-                                                    : "— Pilih Satuan —"}
-                                            </option>
-                                            {satuanOptions.map((s) => (
-                                                <option key={s.id} value={s.id}>
-                                                    {s.nama}
-                                                </option>
-                                            ))}
-                                        </select>
+                                            onChange={setSatuanId}
+                                            placeholder="— Pilih Satuan —"
+                                            disabled={isSaving}
+                                            loading={isMasterDataLoading}
+                                        />
                                     )}
                                 </div>
-                            </div>
-
-                            {/* Lokasi Rak */}
-                            <div>
-                                <label className="mb-1 block font-sans text-xs font-medium text-ink">
-                                    Lokasi Rak
-                                </label>
-                                {mode === "RESTOCK" ? (
-                                    <input
-                                        type="text"
-                                        value={foundSparepart?.lokasiRak?.nama ?? "-"}
-                                        disabled
-                                        className={inputClass(true)}
-                                    />
-                                ) : (
-                                    <select
-                                        value={lokasiRakId}
-                                        onChange={(e) => setLokasiRakId(e.target.value)}
-                                        disabled={isSaving || isMasterDataLoading}
-                                        className={inputClass(false)}
-                                    >
-                                        <option value="">— Tidak ada —</option>
-                                        {lokasiRakOptions.map((l) => (
-                                            <option key={l.id} value={l.id}>
-                                                {l.nama}
-                                            </option>
-                                        ))}
-                                    </select>
-                                )}
                             </div>
 
                             {/* Keterangan */}

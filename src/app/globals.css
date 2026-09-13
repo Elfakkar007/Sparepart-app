@@ -17,6 +17,25 @@
   --color-status-warning: #d97706;
   --color-status-safe: #059669;
 
+  /*
+   * Warna identitas per Line (grid sparepart) — dipakai untuk header
+   * grup kolom L1-L4/General. Untuk background header, JANGAN pakai
+   * warna ini solid; pakai modifier opacity Tailwind v4, mis.
+   * `bg-line1/10`, supaya cukup tipis dan teks header (text-ink)
+   * tetap kebaca jelas di atasnya. Warna solid ini sendiri bisa juga
+   * dipakai penuh untuk aksen kecil lain (mis. dot indikator line).
+   */
+  --color-line1: #2563eb;
+  /* L1 - biru */
+  --color-line2: #7c3aed;
+  /* L2 - ungu */
+  --color-line3: #db2777;
+  /* L3 - pink/rose */
+  --color-line4: #4f46e5;
+  /* L4 - indigo */
+  --color-line-general: #6b7280;
+  /* General - abu netral */
+
   --font-sans: "Inter", sans-serif;
   --font-mono: "JetBrains Mono", monospace;
 }

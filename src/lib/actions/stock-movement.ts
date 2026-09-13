@@ -270,4 +270,58 @@ export async function updateLineMinStok(
     } catch (error) {
         return toFriendlyError(error, "Gagal memperbarui minimal stok");
     }
+
+}
+export type UpdateLineKeteranganResult = {
+    sparepartId: string;
+    line: Line;
+    keterangan: string;
+    /** Baris lengkap — dipakai UI grid untuk sinkronisasi state tanpa reload. */
+    lineStock: SparepartLineStock;
+};
+
+/**
+ * Core logic update keterangan, menerima `tx` supaya konsisten dengan
+ * Core function lain (bisa dipakai dalam transaction gabungan kalau
+ * suatu saat dibutuhkan).
+ */
+export async function updateLineKeteranganCore(
+    tx: TxClient,
+    sparepartId: string,
+    line: Line,
+    keterangan: string
+): Promise<UpdateLineKeteranganResult> {
+    // String kosong = hapus catatan → disimpan sebagai null, bukan "".
+    const keteranganValue = keterangan.trim() || null;
+
+    const lineStock = await tx.sparepartLineStock.upsert({
+        where: { sparepartId_line: { sparepartId, line } },
+        update: { keterangan: keteranganValue },
+        create: { sparepartId, line, keterangan: keteranganValue, jumlah: 0, minStok: 0 },
+    });
+
+    return {
+        sparepartId: lineStock.sparepartId,
+        line: lineStock.line,
+        keterangan: lineStock.keterangan ?? "",
+        lineStock,
+    };
+}
+
+export async function updateLineKeterangan(
+    sparepartId: string,
+    line: Line,
+    keterangan: string
+): Promise<ActionResult<UpdateLineKeteranganResult>> {
+    const session = await auth();
+    if (!session?.user?.id) {
+        return { success: false, message: "Anda harus login" };
+    }
+
+    try {
+        const data = await updateLineKeteranganCore(prisma, sparepartId, line, keterangan);
+        return { success: true, data };
+    } catch (error) {
+        return toFriendlyError(error, "Gagal memperbarui keterangan line");
+    }
 }
