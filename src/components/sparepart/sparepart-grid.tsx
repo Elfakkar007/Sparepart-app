@@ -13,12 +13,16 @@ import {
     ArrowDownToLine,
     ArrowUpFromLine,
 } from "lucide-react";
-// SheetJS — dipakai untuk generate file .xlsx export SEPENUHNYA di client
+// ExcelJS — dipakai untuk generate file .xlsx export SEPENUHNYA di client
 // (tidak lewat Server Action), karena data yang diexport (hasil search +
 // filter aktif, LINTAS SEMUA HALAMAN pagination) sudah ada di memory
-// browser lewat `sortedData`. Cara import sama dengan yang dipakai
-// ImportExcelModal untuk baca file .xlsx yang diupload user.
-import * as XLSX from "xlsx";
+// browser lewat `sortedData`. BUKAN pakai SheetJS (`xlsx`) lagi — versi
+// community SheetJS tidak bisa styling sel (fill warna, border custom),
+// sedangkan header export sekarang butuh cell merge 2-baris + warna per
+// grup Line + border tebal antar grup, yang cuma bisa lewat ExcelJS.
+// ExcelJS tidak punya helper `writeFile` otomatis seperti SheetJS, jadi
+// downloadnya dipicu manual lewat Blob + <a download> di bawah.
+import ExcelJS from "exceljs";
 import {
     deleteSpareparts,
     updateSparepartField,
@@ -1406,71 +1410,338 @@ export function SparepartGrid({
     // eksplisit sesuai header yang ditulis manual, dan tetap menghasilkan
     // sheet dengan baris header yang benar walau `sortedData` sedang kosong
     // (hasil search/filter tidak match apa pun).
-    function handleExport() {
-        const headers: string[] = [
-            "No",
-            "Item Code",
-            "Item",
-            "Kategori",
-            "Satuan",
-            ...LINES.flatMap((line) => [
-                `${line.label} Stok`,
-                `${line.label} Min`,
-                `${line.label} Opname`,
-                `${line.label} Status`,
-                `${line.label} Keterangan`,
-            ]),
-            "Total",
+    async function handleExport() {
+        // === 1. Susun model kolom ===
+        //
+        // Export dibagi 3 "segmen" kolom, kiri ke kanan:
+        //   - leadingCols  : No, Item Code, Item, [Kategori], [Satuan] —
+        //                    masing-masing 1 kolom, merge VERTIKAL row 1-2.
+        //   - lineGroups   : 1 entri per Line, masing-masing 5 sub-kolom
+        //                    (Stok/Min/Opname/Status/Keterangan).
+        //   - trailingCols : [Total] — merge vertikal row 1-2 juga.
+        //
+        // Grup kolom Line yang di-export HARUS mengikuti toggle mata,
+        // persis seperti showKategori/showSatuan/showTotal di atas —
+        // makanya sumbernya `visibleLines` (sudah difilter dari
+        // `hiddenColumns` di baris ~1183), BUKAN `LINES` mentah dari
+        // line-config.ts. `lineGroupRanges`, border grup (groupSeparatorCols),
+        // header row 1/2, isi baris data, dan auto-width kolom di bawah
+        // semuanya diturunkan dari `lineGroups` ini, jadi satu baris ini
+        // adalah satu-satunya sumber kebenaran untuk "line mana yang
+        // ikut export" — jangan balikin ke `LINES` lagi.
+        type LeadingCol = {
+            key: "no" | "itemCode" | "item" | "kategori" | "satuan";
+            label: string;
+            widthPx: number;
+            align: "left" | "center" | "right";
+        };
+        type TrailingCol = {
+            key: "total";
+            label: string;
+            widthPx: number;
+            align: "left" | "center" | "right";
+        };
+
+        const leadingCols: LeadingCol[] = [
+            { key: "no", label: "No", widthPx: NOMOR_WIDTH, align: "center" },
+            { key: "itemCode", label: "Item Code", widthPx: ITEM_CODE_WIDTH, align: "left" },
+            { key: "item", label: "Item", widthPx: ITEM_WIDTH, align: "left" },
+        ];
+        if (showKategori) {
+            leadingCols.push({ key: "kategori", label: "Kategori", widthPx: KATEGORI_WIDTH, align: "left" });
+        }
+        if (showSatuan) {
+            leadingCols.push({ key: "satuan", label: "Satuan", widthPx: SATUAN_WIDTH, align: "left" });
+        }
+
+        const lineGroups = visibleLines;
+
+        const trailingCols: TrailingCol[] = [];
+        if (showTotal) {
+            trailingCols.push({ key: "total", label: "Total", widthPx: TOTAL_WIDTH, align: "right" });
+        }
+
+        // Sub-kolom yang berulang di tiap grup Line, dengan lebar & alignment
+        // masing-masing (dipakai untuk row header ke-2 & untuk isi data).
+        const SUB_COLS: { key: "stok" | "min" | "opname" | "status" | "keterangan"; label: string; widthPx: number; align: "left" | "center" | "right" }[] = [
+            { key: "stok", label: "Stok", widthPx: STOK_COL_WIDTH, align: "right" },
+            { key: "min", label: "Min", widthPx: MIN_COL_WIDTH, align: "right" },
+            { key: "opname", label: "Opname", widthPx: OPNAME_COL_WIDTH, align: "center" },
+            { key: "status", label: "Status", widthPx: LINE_STATUS_WIDTH, align: "center" },
+            { key: "keterangan", label: "Keterangan", widthPx: LINE_KETERANGAN_WIDTH, align: "left" },
         ];
 
-        const rows: (string | number)[][] = sortedData.map((sparepart, index) => {
-            const row: (string | number)[] = [
-                index + 1,
-                sparepart.itemCode,
-                sparepart.namaPart,
-                sparepart.kategori.nama,
-                sparepart.satuan.nama,
-            ];
+        // Konversi lebar px (dipakai <colgroup> di web) ke satuan lebar
+        // kolom ExcelJS (kira-kira lebar 1 karakter "0" di font default,
+        // ±7px) — supaya proporsi lebar kolom export mirip tabel di web.
+        const pxToExcelWidth = (px: number) => Math.max(8, Math.round(px / 7));
 
-            for (const line of LINES) {
+        // === 2. Warna tint per grup Line (row 1 = shade lebih gelap,
+        //     row 2 = shade lebih terang) — urutan biru/ungu/pink/indigo/abu
+        //     mengikuti urutan LINE_1..LINE_4/GENERAL di line-config.ts. ===
+        const LINE_GROUP_COLORS: Record<Line, { header: string; sub: string }> = {
+            LINE_1: { header: "FFDBEAFE", sub: "FFEFF6FF" }, // biru
+            LINE_2: { header: "FFE9D5FF", sub: "FFF5F0FF" }, // ungu
+            LINE_3: { header: "FFFCE7F3", sub: "FFFDF2F8" }, // pink
+            LINE_4: { header: "FFE0E7FF", sub: "FFEEF2FF" }, // indigo
+            GENERAL: { header: "FFE5E7EB", sub: "FFF3F4F6" }, // abu-abu
+        };
+
+        // Warna badge Status per baris data — hijau utk "Cukup", merah utk
+        // "Kurang", supaya konsisten dengan StatusBadge yang tampil di grid.
+        const STATUS_COLORS: Record<"Cukup" | "Kurang", { fill: string; font: string }> = {
+            Cukup: { fill: "FFDCFCE7", font: "FF166534" },
+            Kurang: { fill: "FFFEE2E2", font: "FF991B1B" },
+        };
+
+        const BORDER_COLOR = "FF9CA3AF"; // abu netral, dipakai border tipis & tebal
+        const THIN_BORDER: Partial<ExcelJS.Border> = { style: "thin", color: { argb: BORDER_COLOR } };
+        const MEDIUM_BORDER: Partial<ExcelJS.Border> = { style: "medium", color: { argb: BORDER_COLOR } };
+
+        // === 3. Hitung index kolom (1-based, sesuai konvensi ExcelJS) ===
+        //
+        // colCursor berjalan dari kiri ke kanan; groupSeparatorCols menandai
+        // kolom PALING KANAN tiap grup Line (sub-kolom Keterangan) supaya
+        // border kanannya dibuat "medium", bukan "thin" — dipakai di SEMUA
+        // baris (header row 1, row 2, dan setiap baris data).
+        let colCursor = 1;
+        const leadingColStart = colCursor;
+        colCursor += leadingCols.length;
+
+        const lineGroupRanges: { line: (typeof lineGroups)[number]; start: number; end: number }[] = [];
+        for (const line of lineGroups) {
+            const start = colCursor;
+            const end = start + SUB_COLS.length - 1;
+            lineGroupRanges.push({ line, start, end });
+            colCursor = end + 1;
+        }
+
+        const trailingColStart = colCursor;
+        colCursor += trailingCols.length;
+
+        const totalCols = colCursor - 1;
+        const groupSeparatorCols = new Set(lineGroupRanges.map((g) => g.end));
+
+        // === 4. Buat workbook & worksheet ===
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet("Sparepart");
+
+        // Baris 1-2 dipakai header (2 baris), data mulai baris 3.
+        const headerRow1 = worksheet.getRow(1);
+        const headerRow2 = worksheet.getRow(2);
+
+        // Helper set border 1 sel: kanan "medium" kalau kolom ini penutup
+        // grup Line, selain itu "thin" di keempat sisi.
+        function applyCellBorder(cell: ExcelJS.Cell, colIndex: number) {
+            cell.border = {
+                top: THIN_BORDER,
+                left: THIN_BORDER,
+                bottom: THIN_BORDER,
+                right: groupSeparatorCols.has(colIndex) ? MEDIUM_BORDER : THIN_BORDER,
+            };
+        }
+
+        // --- 4a. Kolom leading (No/Item Code/Item/Kategori/Satuan) ---
+        // Merge vertikal row 1-2 supaya sejajar dengan grup Line (2 baris).
+        leadingCols.forEach((col, i) => {
+            const colIndex = leadingColStart + i;
+            worksheet.mergeCells(1, colIndex, 2, colIndex);
+            const cell = headerRow1.getCell(colIndex);
+            cell.value = col.label;
+            cell.font = { bold: true };
+            cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+            applyCellBorder(cell, colIndex);
+            // Sel bawahan hasil merge juga perlu border sendiri (lihat
+            // catatan di applyCellBorder) supaya border row 2-nya konsisten.
+            applyCellBorder(headerRow2.getCell(colIndex), colIndex);
+        });
+
+        // --- 4b. Grup Line: row 1 merge horizontal 5 kolom + label line,
+        //     row 2 diisi Stok/Min/Opname/Status/Keterangan ---
+        for (const { line, start, end } of lineGroupRanges) {
+            const colors = LINE_GROUP_COLORS[line.key];
+
+            worksheet.mergeCells(1, start, 1, end);
+            const groupCell = headerRow1.getCell(start);
+            groupCell.value = line.label;
+            groupCell.font = { bold: true };
+            groupCell.alignment = { vertical: "middle", horizontal: "center" };
+            groupCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: colors.header } };
+
+            // Semua sel yang ikut ter-merge di row 1 harus dapat fill +
+            // border yang sama (lihat catatan border di bawah handleExport).
+            for (let c = start; c <= end; c++) {
+                const cell = headerRow1.getCell(c);
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: colors.header } };
+                applyCellBorder(cell, c);
+            }
+
+            // Row 2: Stok/Min/Opname/Status/Keterangan, shade lebih terang.
+            SUB_COLS.forEach((sub, i) => {
+                const c = start + i;
+                const cell = headerRow2.getCell(c);
+                cell.value = sub.label;
+                cell.font = { bold: true };
+                cell.alignment = { vertical: "middle", horizontal: "center" };
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: colors.sub } };
+                applyCellBorder(cell, c);
+            });
+        }
+
+        // --- 4c. Kolom trailing (Total) — merge vertikal row 1-2 ---
+        trailingCols.forEach((col, i) => {
+            const colIndex = trailingColStart + i;
+            worksheet.mergeCells(1, colIndex, 2, colIndex);
+            const cell = headerRow1.getCell(colIndex);
+            cell.value = col.label;
+            cell.font = { bold: true };
+            cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+            applyCellBorder(cell, colIndex);
+            applyCellBorder(headerRow2.getCell(colIndex), colIndex);
+        });
+
+        headerRow1.height = 20;
+        headerRow2.height = 20;
+
+        // === 5. Baris data, mulai row 3 ===
+        //
+        // maxContentWidth dipakai untuk auto-width kolom di langkah 6 —
+        // dimulai dari lebar header, lalu diperbesar kalau ada isi data
+        // yang lebih panjang dari header-nya.
+        const maxContentWidth = new Map<number, number>();
+        function trackWidth(colIndex: number, text: string) {
+            const current = maxContentWidth.get(colIndex) ?? 0;
+            maxContentWidth.set(colIndex, Math.max(current, text.length));
+        }
+        // Inisialisasi dari label header supaya kolom tidak lebih sempit
+        // dari headernya sendiri.
+        leadingCols.forEach((col, i) => trackWidth(leadingColStart + i, col.label));
+        for (const { start } of lineGroupRanges) {
+            SUB_COLS.forEach((sub, i) => trackWidth(start + i, sub.label));
+        }
+        trailingCols.forEach((col, i) => trackWidth(trailingColStart + i, col.label));
+
+        sortedData.forEach((sparepart, index) => {
+            const excelRowIndex = index + 3; // data mulai row 3
+            const row = worksheet.getRow(excelRowIndex);
+
+            function writeCell(colIndex: number, value: string | number, align: "left" | "center" | "right") {
+                const cell = row.getCell(colIndex);
+                cell.value = value;
+                cell.alignment = { vertical: "middle", horizontal: align };
+                applyCellBorder(cell, colIndex);
+                trackWidth(colIndex, String(value));
+            }
+
+            // -- Leading cols --
+            leadingCols.forEach((col, i) => {
+                const colIndex = leadingColStart + i;
+                let value: string | number;
+                switch (col.key) {
+                    case "no":
+                        value = index + 1;
+                        break;
+                    case "itemCode":
+                        value = sparepart.itemCode;
+                        break;
+                    case "item":
+                        value = sparepart.namaPart;
+                        break;
+                    case "kategori":
+                        value = sparepart.kategori.nama;
+                        break;
+                    case "satuan":
+                        value = sparepart.satuan.nama;
+                        break;
+                }
+                writeCell(colIndex, value, col.align);
+            });
+
+            // -- Grup Line --
+            for (const { line, start } of lineGroupRanges) {
                 const lineStock = sparepart.lineStocks.find((ls) => ls.line === line.key);
                 const jumlah = lineStock ? lineStock.jumlah : 0;
                 const minStok = lineStock ? lineStock.minStok : 0;
+                // NOTE: aturan "Kurang" di sini pakai perbandingan langsung
+                // jumlah vs minStok line ini (jumlah < minStok = "Kurang"),
+                // SATU LOGIC dengan yang dipakai computeLineStatus untuk
+                // StatusBadge di grid. Kalau ambang computeLineStatus di
+                // lib/status-helper.ts ternyata berbeda (mis. ada buffer /
+                // status ketiga selain cukup-kurang), sesuaikan baris di
+                // bawah ini supaya label export tetap konsisten dengan
+                // badge yang tampil di layar.
+                const status: "Cukup" | "Kurang" = jumlah < minStok ? "Kurang" : "Cukup";
 
-                row.push(
-                    jumlah,
-                    minStok,
+                writeCell(start, jumlah, "right");
+                writeCell(start + 1, minStok, "right");
+                writeCell(
+                    start + 2,
                     // "" (bukan "-") saat belum pernah opname, sesuai spek export.
                     formatTanggalOpname(lineStock ? lineStock.lastOpnameDate : null, ""),
-                    // NOTE: aturan "Kurang" di sini pakai perbandingan langsung
-                    // jumlah vs minStok line ini (jumlah < minStok = "Kurang"),
-                    // SATU LOGIC dengan yang dipakai computeLineStatus untuk
-                    // StatusBadge di grid. Kalau ambang computeLineStatus di
-                    // lib/status-helper.ts ternyata berbeda (mis. ada buffer /
-                    // status ketiga selain cukup-kurang), sesuaikan baris di
-                    // bawah ini supaya label export tetap konsisten dengan
-                    // badge yang tampil di layar.
-                    jumlah < minStok ? "Kurang" : "Cukup",
-                    lineStock?.keterangan ?? ""
+                    "center"
                 );
+
+                const statusColIndex = start + 3;
+                const statusCell = row.getCell(statusColIndex);
+                statusCell.value = status;
+                statusCell.alignment = { vertical: "middle", horizontal: "center" };
+                statusCell.font = { bold: true, color: { argb: STATUS_COLORS[status].font } };
+                statusCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: STATUS_COLORS[status].fill } };
+                applyCellBorder(statusCell, statusColIndex);
+                trackWidth(statusColIndex, status);
+
+                writeCell(start + 4, lineStock?.keterangan ?? "", "left");
             }
 
-            row.push(sparepart.stok);
-            return row;
+            // -- Total --
+            trailingCols.forEach((col, i) => {
+                writeCell(trailingColStart + i, sparepart.stok, col.align);
+            });
         });
 
-        const worksheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
-        const workbook = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(workbook, worksheet, "Sparepart");
+        // === 6. Auto-width kolom, berdasarkan konten terpanjang (header +
+        //     data), dengan lebar minimum dari LEBAR_PX (langkah 1) supaya
+        //     tidak lebih sempit dari proporsi tampilan web. ===
+        const widthPxByCol = new Map<number, number>();
+        leadingCols.forEach((col, i) => widthPxByCol.set(leadingColStart + i, col.widthPx));
+        for (const { start } of lineGroupRanges) {
+            SUB_COLS.forEach((sub, i) => widthPxByCol.set(start + i, sub.widthPx));
+        }
+        trailingCols.forEach((col, i) => widthPxByCol.set(trailingColStart + i, col.widthPx));
+
+        for (let c = 1; c <= totalCols; c++) {
+            const minWidth = pxToExcelWidth(widthPxByCol.get(c) ?? 80);
+            const contentWidth = (maxContentWidth.get(c) ?? 0) + 2; // padding
+            worksheet.getColumn(c).width = Math.max(minWidth, contentWidth);
+        }
+
+        // Freeze 2 baris header supaya tetap kelihatan saat scroll, mirip
+        // sticky header di tampilan web.
+        worksheet.views = [{ state: "frozen", ySplit: 2 }];
+
+        // === 7. Trigger download ===
+        //
+        // ExcelJS tidak punya writeFile bawaan untuk browser (beda dari
+        // SheetJS) — buffer hasil generate dibungkus Blob lalu dipicu lewat
+        // <a download> sementara.
+        const buffer = await workbook.xlsx.writeBuffer();
+        const blob = new Blob([buffer], {
+            type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        });
+        const url = URL.createObjectURL(blob);
 
         const now = new Date();
         const yyyy = now.getFullYear();
         const mm = String(now.getMonth() + 1).padStart(2, "0");
         const dd = String(now.getDate()).padStart(2, "0");
 
-        // writeFile trigger download otomatis di browser (tidak perlu bikin
-        // <a> + Blob + URL.createObjectURL manual — sudah ditangani SheetJS).
-        XLSX.writeFile(workbook, `sparepart-export-${yyyy}${mm}${dd}.xlsx`);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `sparepart-export-${yyyy}${mm}${dd}.xlsx`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
     }
 
     // --- Handler submit tiap jenis sel edit — dipanggil dari onSubmit

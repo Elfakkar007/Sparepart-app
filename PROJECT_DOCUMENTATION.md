@@ -57,10 +57,12 @@ Folder bawaan Next.js App Router. Setiap folder di dalamnya yang memiliki file `
 
 ### 📂 `src/components/`
 Berisi komponen-komponen React (UI) modular pembangun tampilan aplikasi. Area ini murni berjalan di sisi **Frontend**.
+- 📂 **`layout/`**: Komponen pembentuk kerangka struktur halaman (*layout*).
+  - `sidebar.tsx`: Komponen navigasi samping (*sidebar*) utama yang adaptif (bisa *collapse/expand*), menampilkan menu navigasi modul-modul, tombol *logout*, dan identitas *user* aktif.
 - 📂 **`sparepart/`**: Komponen spesifik untuk manajemen sparepart.
   - `sparepart-grid.tsx`: Komponen masif dan paling penting. Menangani UI tabel *sparepart*, mengatur sel mana yang bisa di-*edit*, kalkulasi ukuran kolom dinamis, dan *sticky header*.
-  - `filter-popup.tsx`: UI komponen *dropdown* untuk menyaring data (berdasarkan kategori, satuan, lokasi, status).
-  - `line-visibility-popup.tsx`: UI komponen berupa popup kecil (ikon mata) untuk menyembunyikan atau menampilkan kolom-kolom untuk *Line* tertentu di tabel.
+  - `filter-popup.tsx`: UI komponen *dropdown* untuk menyaring data (berdasarkan *line*, kategori, satuan, lokasi, status).
+  - `column-visibility-popup.tsx`: UI komponen berupa popup kecil (ikon mata) untuk menyembunyikan atau menampilkan berbagai kolom di tabel (seperti Kategori, Satuan, Total, dan grup kolom per-Line).
   - `popover-portal.tsx`: Komponen utilitas (*Portal*) yang membantu me-render popup menembus hierarki HTML sehingga popup tidak terpotong oleh batas *scroll* atau *overflow* tabel.
   - `smart-form-modal.tsx`: Komponen jendela *modal* dinamis untuk membuat item *sparepart* baru atau melakukan *restock* barang.
   - `import-excel-modal.tsx`: Komponen jendela *modal* untuk mengunggah file Excel secara massal.

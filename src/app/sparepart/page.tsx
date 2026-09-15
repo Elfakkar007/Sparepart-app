@@ -1,4 +1,3 @@
-import Link from "next/link";
 import { getSparepartList } from "@/lib/actions/sparepart";
 import {
     getKategoriList,
@@ -19,14 +18,6 @@ export default async function SparepartPage() {
 
     return (
         <div>
-            <div className="flex justify-end px-4 pt-4">
-                <Link
-                    href="/master-data"
-                    className="text-sm font-medium text-primary hover:underline"
-                >
-                    Kelola Master Data
-                </Link>
-            </div>
 
             <SparepartGrid
                 initialData={sparepartResult.success ? sparepartResult.data : []}
